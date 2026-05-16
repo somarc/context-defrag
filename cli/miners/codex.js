@@ -73,7 +73,7 @@ async function mine({ since, verbose } = {}) {
   return { source: 'codex', sessions: unique };
 }
 
-// ── Mine individual JSON session files ───────────────────────────────────────
+// ── Mine individual JSON session files (recursive — handles YYYY/MM/DD nesting) ──
 async function mineSessionsDir(dir, { since, verbose }) {
   const sessions = [];
   let entries;
@@ -85,6 +85,15 @@ async function mineSessionsDir(dir, { since, verbose }) {
   }
 
   for (const entry of entries) {
+    // Recurse into subdirectories (handles ~/.codex/sessions/2026/05/16/ layout)
+    if (entry.isDirectory()) {
+      const subSessions = await mineSessionsDir(
+        path.join(dir, entry.name), { since, verbose }
+      );
+      sessions.push(...subSessions);
+      continue;
+    }
+
     if (!entry.isFile()) continue;
     const ext = path.extname(entry.name).toLowerCase();
     if (ext !== '.json' && ext !== '.jsonl') continue;
