@@ -32,6 +32,7 @@ const cursorMiner  = require('./miners/cursor');
 const { extract }  = require('./extractor');
 const { write }    = require('./writers/obsidian');
 const { link }     = require('./writers/linker');
+const tui          = require('./tui');
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const VERSION              = '1.0';
@@ -72,8 +73,10 @@ async function main() {
 // ── Core pipeline — scan, extract, write ─────────────────────────────────────
 async function runPipeline(opts) {
   printBanner();
+  tui.init();
 
   // ── Phase 1: Scan sources ───────────────────────────────────────────────
+  tui.update({ phase: 'SCANNING', pct: 5 });
   print('Scanning sources...');
 
   const sinceDate  = opts.since ? new Date(opts.since) : null;
@@ -83,10 +86,25 @@ async function runPipeline(opts) {
     die(`Invalid --since date: "${opts.since}"`);
   }
 
+  // Mark all requested sources as 'scanning'
+  const initialSources = {};
+  for (const src of ALL_SOURCES) {
+    initialSources[src] = { found: false, sessions: 0 };
+  }
+  tui.update({ sources: initialSources });
+
   const allSessions = [];       // { session, extracted }
   const scanResults = {};       // source → { found, sessions, path }
 
   for (const source of sources) {
+    // Animate the source as "scanning" while we mine it
+    const scanningPatch = {};
+    for (const src of ALL_SOURCES) {
+      scanningPatch[src] = { found: false, sessions: 0 };
+    }
+    // Mark this source as scanning (will show animated dots)
+    tui.update({ sources: scanningPatch });
+
     const miner = MINER_MAP[source];
     if (!miner) {
       printStatus('WARN', SOURCE_DISPLAY_PATHS[source] || source, `Unknown source, skipping`);
@@ -113,6 +131,14 @@ async function runPipeline(opts) {
     }
 
     allSessions.push(...sessions);
+
+    // Update TUI with accumulated scan state
+    tui.update({
+      phase:    'SCANNING',
+      pct:      10,
+      sessions: allSessions.length,
+      sources:  scanResults,
+    });
   }
 
   // Fill in any sources that weren't processed (filtered out via --sources)
@@ -124,9 +150,18 @@ async function runPipeline(opts) {
 
   const totalFound = allSessions.length;
 
+  tui.update({
+    phase:    'EXTRACTING',
+    pct:      20,
+    sessions: totalFound,
+    sources:  scanResults,
+  });
+  tui.log(`[SCAN] Found ${totalFound} session${totalFound !== 1 ? 's' : ''} across ${sources.length} source${sources.length !== 1 ? 's' : ''}`);
+
   if (totalFound === 0) {
     print('');
     print('No conversations found. Nothing to do.');
+    await tui.done();
     return;
   }
 
@@ -142,12 +177,16 @@ async function runPipeline(opts) {
 
   // ── Phase 3: Extract concepts, decisions, snippets, URLs ────────────────
   print('Extracting concepts...');
+  tui.update({ phase: 'EXTRACTING', pct: 25 });
 
   const enriched = [];          // { session, extracted }
   const conceptFreq = new Map(); // concept → total mention count (for summary)
+  const total = dedupedSessions.length;
 
-  for (const session of dedupedSessions) {
+  for (let si = 0; si < total; si++) {
+    const session   = dedupedSessions[si];
     const extracted = extract(session);
+    const pct       = 25 + Math.floor((si / total) * 20); // 25–45%
 
     if (opts.verbose) {
       const conceptSample = extracted.concepts.slice(0, 5).join(', ');
@@ -168,22 +207,32 @@ async function runPipeline(opts) {
     }
 
     enriched.push({ session, extracted });
+
+    // Throttle TUI updates to avoid spam on large session sets
+    if (si % 10 === 0 || si === total - 1) {
+      tui.update({ phase: 'EXTRACTING', pct, sessions: si + 1 });
+    }
   }
 
   const totalConcepts = conceptFreq.size;
   const totalSnippets = enriched.reduce((n, { extracted }) => n + extracted.snippets.length, 0);
   const totalUrls     = enriched.reduce((n, { extracted }) => n + extracted.urls.length, 0);
 
+  tui.update({ phase: 'WRITING', pct: 45, concepts: totalConcepts });
+  tui.log(`[SCAN] Extracted ${totalConcepts} concept${totalConcepts !== 1 ? 's' : ''}, ${totalSnippets} snippet${totalSnippets !== 1 ? 's' : ''}`);
+
   print('');
 
   // ── Phase 4: Write vault ────────────────────────────────────────────────
   if (!opts.dryRun) {
     print(`Writing vault to ${opts.output}...`);
+    tui.log(`[WRITE] Writing vault to ${opts.output}`);
     if (opts.minSignal !== DEFAULT_MIN_SIGNAL) {
       print(`  Signal threshold: ${opts.minSignal} (default: ${DEFAULT_MIN_SIGNAL})`);
     }
   } else {
     print('Dry run — no files will be written');
+    tui.log('[DRY] Dry run — no files will be written');
   }
 
   let writeStats = { written: 0, skipped: 0 };
@@ -195,28 +244,44 @@ async function runPipeline(opts) {
       dryRun:          opts.dryRun,
       verbose:         opts.verbose,
       signalThreshold: opts.minSignal,
+      onProgress: (msg) => {
+        tui.log(`[WRITE] ${msg}`);
+      },
     });
   } catch (err) {
     die(`Write error: ${err.message}`);
   }
 
+  tui.update({ phase: 'LINKING', pct: 70, files: writeStats.written });
+  tui.log(`[WRITE] Vault written — ${writeStats.written} file${writeStats.written !== 1 ? 's' : ''}`);
+
   print('');
 
   // ── Phase 5: Build wikilinks ────────────────────────────────────────────
   print('Building links...');
+  tui.log('[LINK] Building wikilinks...');
 
-  let linkStats = { linksCreated: 0 };
+  let linkStats   = { linksCreated: 0 };
+  let currentLinkCount = 0;
+
   if (!opts.dryRun) {
     try {
       linkStats = link({
-        vaultDir: opts.output,
-        dryRun:   opts.dryRun,
-        verbose:  opts.verbose,
+        vaultDir:   opts.output,
+        dryRun:     opts.dryRun,
+        verbose:    opts.verbose,
+        onProgress: (msg) => {
+          currentLinkCount++;
+          tui.log(`[LINK] ${msg}`);
+          tui.update({ links: currentLinkCount });
+        },
       });
     } catch (err) {
       if (opts.verbose) print(`  [WARN] Linker error: ${err.message}`);
     }
   }
+
+  tui.update({ phase: 'LINKING', pct: 90, links: linkStats.linksCreated });
 
   // Print top linked concepts
   const topLinked = [...conceptFreq.entries()]
@@ -225,12 +290,12 @@ async function runPipeline(opts) {
 
   for (const [concept, count] of topLinked) {
     print(`  [[${titleCase(concept)}]] linked to ${count} note${count !== 1 ? 's' : ''}`);
+    tui.log(`[LINK] [[${titleCase(concept)}]] → ${count} note${count !== 1 ? 's' : ''}`);
   }
 
   print('');
 
   // ── Phase 6: Write defrag.json manifest ─────────────────────────────────
-  // The manifest connects the CLI output to the web visualizer and QMD integration.
   const topConceptsList = [...conceptFreq.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
@@ -267,6 +332,10 @@ async function runPipeline(opts) {
   }
 
   // ── Final summary ───────────────────────────────────────────────────────
+  tui.update({ phase: 'COMPLETE', pct: 100, links: linkStats.linksCreated });
+
+  tui.log('It is now safe to turn off your computer.');
+
   print('Complete!');
   printStat('Sessions processed', dedupedSessions.length);
   printStat('Concepts extracted', totalConcepts);
@@ -284,6 +353,8 @@ async function runPipeline(opts) {
   if (opts.gptKo) {
     await runQmdIntegration(opts.output, opts.verbose);
   }
+
+  await tui.done();
 }
 
 // ── QMD integration ──────────────────────────────────────────────────────────
@@ -513,6 +584,9 @@ function deduplicateSessions(sessions) {
 
 // ── Output helpers ────────────────────────────────────────────────────────────
 function printBanner() {
+  // In TUI mode the banner is rendered inside the header — keep plain output quiet
+  if (tui.ENABLED) return;
+
   const line = '='.repeat(19);
   console.log('');
   console.log(`CONTEXT DEFRAG v${VERSION}`);
@@ -521,17 +595,19 @@ function printBanner() {
 }
 
 function print(msg) {
-  console.log(msg);
+  tui.log(msg);
 }
 
 function printStatus(statusCode, label, description) {
   const code = statusCode.padEnd(2);
-  console.log(`  [${code}] ${label.padEnd(30)} ${description}`);
+  const msg  = `[${code}] ${label.padEnd(30)} ${description}`;
+  tui.log(msg);
 }
 
 function printStat(label, value) {
   const paddedLabel = (label + ':').padEnd(22);
-  console.log(`  ${paddedLabel} ${value}`);
+  const msg = `  ${paddedLabel} ${value}`;
+  tui.log(msg);
 }
 
 function printHelp() {

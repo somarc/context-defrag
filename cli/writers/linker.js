@@ -18,12 +18,13 @@ const path = require('path');
 
 // ── Main export ──────────────────────────────────────────────────────────────
 /**
- * @param {string} vaultDir  - Root vault directory
- * @param {boolean} dryRun
- * @param {boolean} verbose
+ * @param {string}   vaultDir   - Root vault directory
+ * @param {boolean}  dryRun
+ * @param {boolean}  verbose
+ * @param {Function} onProgress - Optional callback(msg) called for each linked file
  * @returns {{ linksCreated: number }}
  */
-function link({ vaultDir, dryRun, verbose }) {
+function link({ vaultDir, dryRun, verbose, onProgress }) {
   const registry = buildRegistry(vaultDir);
 
   if (verbose) {
@@ -47,8 +48,14 @@ function link({ vaultDir, dryRun, verbose }) {
 
     if (count > 0) {
       linksCreated += count;
+
       if (verbose) {
         console.log(`  [[linked]] ${count} reference(s) in ${path.relative(vaultDir, filePath)}`);
+      }
+
+      // Fire progress callback for the TUI activity log
+      if (onProgress) {
+        onProgress(`[[linked]] ${count} ref${count !== 1 ? 's' : ''} in ${path.relative(vaultDir, filePath)}`);
       }
 
       if (!dryRun) {
