@@ -42,7 +42,7 @@ The tool produces two distinct layers, each optimized for a different access pat
 
 **Vault layer** (`concepts/`, `sessions/`, `code/`, `links.md`, `_timeline.md`): structured, human-readable Markdown optimized for Obsidian's graph navigation and manual curation. A human can open this vault, browse the graph, click into a concept note, and immediately see every session where that concept was discussed, every decision made about it, and every related concept. The vault is the primary interface. It is designed for exploration, not just search.
 
-**Search layer** (QMD): a semantic index over the vault, consumed programmatically. QMD reads `defrag.json` to discover the vault contents, indexes the structured body text, and exposes filtered queries like `qmd query "replication retry" --source claude --since 30d`. The search layer is for retrieval when you know roughly what you're looking for but don't want to browse.
+**Search layer** ([QMD](https://github.com/tobi/qmd)): a semantic index over the vault, consumed programmatically. QMD reads `defrag.json` to discover the vault contents, indexes the structured body text, and exposes filtered queries like `qmd query "replication retry" --source claude --since 30d`. The search layer is for retrieval when you know roughly what you're looking for but don't want to browse.
 
 These layers complement each other. The vault is for discovery and serendipitous connection. QMD is for targeted lookup. Neither alone is sufficient.
 
