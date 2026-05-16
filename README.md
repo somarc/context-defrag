@@ -15,7 +15,7 @@
 ║   ╚═════╝ ╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝               ║
 ╠═══════════════════════════════════════════════════════════════════╣
 ║  Microsoft(R) Context Defragmenter    Version 1.0                 ║
-║  Copyright (C) context-defrag contributors, 2025.                 ║
+║  Copyright (C) context-defrag contributors, 2026.                 ║
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
