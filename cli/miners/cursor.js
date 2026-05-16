@@ -37,25 +37,25 @@ const CHAT_KEYS = [
   'cursor.chatHistory',
 ];
 
-// ── Attempt to load better-sqlite3 ──────────────────────────────────────────
-let Database;
-try {
-  Database = require('better-sqlite3');
-} catch (_) {
-  Database = null;
+// ── SQLite loader — prefer built-in node:sqlite (Node 22+), fall back to better-sqlite3 ──
+function openDatabase(dbPath) {
+  // Node 22+ ships sqlite natively — no native addon, no compilation
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    return new DatabaseSync(dbPath, { allowExtension: false });
+  } catch (_) {}
+  // Older Node: try better-sqlite3
+  try {
+    const BetterSqlite = require('better-sqlite3');
+    return new BetterSqlite(dbPath, { readonly: true });
+  } catch (_) {}
+  return null;
 }
 
 // ── Main export ──────────────────────────────────────────────────────────────
 async function mine({ since, verbose } = {}) {
   if (!fs.existsSync(CURSOR_ROOT)) {
     return { source: 'cursor', sessions: [], skipped: [CURSOR_ROOT] };
-  }
-
-  if (!Database) {
-    if (verbose) {
-      console.error('  [WARN] cursor: better-sqlite3 not available — SQLite sources skipped');
-    }
-    return { source: 'cursor', sessions: [], skipped: ['better-sqlite3 missing'] };
   }
 
   const sessions = [];
@@ -112,21 +112,21 @@ function mineVscdb(dbPath, workspaceHash, { since, verbose }) {
   const sessions = [];
   let db;
 
-  try {
-    db = new Database(dbPath, { readonly: true });
-  } catch (err) {
-    if (verbose) console.error(`  [WARN] cursor: cannot open ${dbPath}: ${err.message}`);
+  db = openDatabase(dbPath);
+  if (!db) {
+    if (verbose) console.error(`  [WARN] cursor: no SQLite driver available to open ${dbPath}`);
     return sessions;
   }
 
   try {
-    // Verify ItemTable exists
-    const tables = db.prepare(
+    // Verify ItemTable exists — handle both node:sqlite and better-sqlite3 APIs
+    const tableRows = db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table'"
-    ).all().map((r) => r.name);
+    ).all();
+    const tables = tableRows.map((r) => r.name);
 
     if (!tables.includes('ItemTable')) {
-      db.close();
+      try { db.close(); } catch (_) {}
       return sessions;
     }
 

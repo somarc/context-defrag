@@ -17,8 +17,10 @@
     "test": "node cli/defrag.js --dry-run --verbose"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
     "glob": "^10.3.10"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^9.4.3"
   },
   "engines": {
     "node": ">=18.0.0"

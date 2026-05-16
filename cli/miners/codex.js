@@ -19,12 +19,17 @@ const readline = require('readline');
 
 const CODEX_ROOT = path.join(os.homedir(), '.codex');
 
-// ── Attempt to load better-sqlite3 (optional dependency) ────────────────────
-let Database;
-try {
-  Database = require('better-sqlite3');
-} catch (_) {
-  Database = null;
+// ── SQLite loader — prefer built-in node:sqlite (Node 22+), fall back to better-sqlite3 ──
+function openDatabase(dbPath) {
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    return new DatabaseSync(dbPath, { allowExtension: false });
+  } catch (_) {}
+  try {
+    const BetterSqlite = require('better-sqlite3');
+    return new BetterSqlite(dbPath, { readonly: true });
+  } catch (_) {}
+  return null;
 }
 
 // ── Main export: mine all Codex sessions ────────────────────────────────────
@@ -224,10 +229,9 @@ function mineDatabase(dbFile, { since, verbose }) {
   const sessions = [];
   let db;
 
-  try {
-    db = new Database(dbFile, { readonly: true });
-  } catch (err) {
-    if (verbose) console.error(`  [WARN] codex: could not open ${dbFile}: ${err.message}`);
+  db = openDatabase(dbFile);
+  if (!db) {
+    if (verbose) console.error(`  [WARN] codex: no SQLite driver available to open ${dbFile}`);
     return sessions;
   }
 
