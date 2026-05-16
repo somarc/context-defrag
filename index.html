@@ -455,6 +455,49 @@ body::before {
 .rm-dim  { color: var(--dgray); }
 .rm-hi   { color: var(--white); }
 
+/* ── QMD copy button ─────────────────────────────────────── */
+.qmd-copy-btn {
+  font-family: var(--font);
+  font-size: 12px;
+  background: var(--bg);
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  padding: 2px 12px;
+  cursor: pointer;
+  outline: none;
+  display: inline-block;
+  letter-spacing: 1px;
+  margin-top: 8px;
+}
+.qmd-copy-btn:hover, .qmd-copy-btn:focus {
+  background: var(--dcyan);
+  color: var(--bg);
+  border-color: var(--white);
+}
+.qmd-copy-btn:active {
+  background: var(--cyan);
+  color: var(--bg);
+}
+.qmd-copy-btn.copied {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+/* ── Vault ready panel ───────────────────────────────────── */
+#vault-ready {
+  display: none;
+  margin: 0 8px 6px;
+  border: 1px solid var(--green);
+  padding: 10px 14px;
+  background: var(--bg);
+  color: var(--green);
+  font-family: var(--font);
+  font-size: 12px;
+  white-space: pre;
+  line-height: 1.6;
+}
+#vault-ready.show { display: block; }
+
 /* ── Responsive ──────────────────────────────────────────── */
 @media (max-width: 540px) {
   :root { --fs: 11px; }
@@ -486,7 +529,7 @@ body::before {
     <div style="display:flex; align-items:center;">
       <span class="bdr">║</span>
       <div style="flex:1; text-align:center;">
-        <span class="win-sub">somarc/context-defrag</span>
+        <span class="win-sub">context-defrag</span>
       </div>
       <span class="bdr">║</span>
     </div>
@@ -531,6 +574,9 @@ body::before {
 
     <!-- div 3 -->
     <div id="hr-3" class="bdr"></div>
+
+    <!-- vault ready panel (shown after defrag when real data loaded) -->
+    <div id="vault-ready"></div>
 
     <!-- status section -->
     <div id="status-wrap">
@@ -598,7 +644,7 @@ body::before {
   <div class="safe-box">
     It is now safe to<br>turn off your computer.
   </div>
-  <div class="safe-sub">context-defrag v1.0 — somarc/context-defrag</div>
+  <div class="safe-sub">context-defrag v1.0</div>
 </div>
 
 <script>
@@ -624,6 +670,81 @@ const BS = {
   LINKED:   's-linked',
   COMPLETE: 's-complete',
 };
+
+/* ════════════════════════════════════════════════════════════
+   REAL DATA (loaded from defrag.json, or null = demo mode)
+   ════════════════════════════════════════════════════════════ */
+let realData = null; // populated by loadDefragJson()
+
+async function loadDefragJson() {
+  try {
+    const res = await fetch('./defrag.json');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data && typeof data === 'object') {
+      realData = data;
+    }
+  } catch (_) {
+    // demo mode — no error shown
+  }
+}
+
+/* ── Build dynamic message pools from real data ── */
+function buildRealMsgPools() {
+  if (!realData) return;
+
+  const stats    = realData.stats    || {};
+  const concepts = realData.concepts || [];
+  const sessions = realData.sessions || [];
+
+  // Augment scan messages with real session titles
+  if (sessions.length > 0) {
+    const realScanMsgs = sessions.slice(0, 12).map(s =>
+      "Reading: '" + (s.title || s.name || s.id || 'session') + "'"
+    );
+    MSGS.scan = realScanMsgs.concat(MSGS.scan);
+  }
+
+  // Augment scan messages with real concept extractions
+  if (concepts.length > 0) {
+    const realConceptMsgs = concepts.slice(0, 10).map(c =>
+      'Extracting concept: [[' + (typeof c === 'string' ? c : c.name || c.title || String(c)) + ']]'
+    );
+    MSGS.scan = MSGS.scan.concat(realConceptMsgs);
+  }
+
+  // Augment defrag messages with real concept writing lines
+  if (concepts.length > 0) {
+    const realDefragMsgs = concepts.slice(0, 8).map(c => {
+      const name = typeof c === 'string' ? c : c.name || c.title || String(c);
+      return 'Writing note: vault/concepts/' + name.toLowerCase().replace(/\s+/g, '-') + '.md';
+    });
+    MSGS.defrag = realDefragMsgs.concat(MSGS.defrag);
+  }
+
+  // Augment cluster name pool with real session titles
+  if (sessions.length > 0) {
+    const realCnames = sessions.slice(0, 8).map(s =>
+      "'" + (s.title || s.name || s.id || 'session') + "'"
+    );
+    CNAMES.unshift(...realCnames);
+  }
+}
+
+/* ── Build real boot sequence items for source counts ── */
+function getRealBootSeq() {
+  if (!realData) return null;
+  const stats    = realData.stats    || {};
+  const sessions = realData.sessions || [];
+  const convCount = stats.sessions || stats.conversations || sessions.length || 0;
+  const clusterCount = (stats.sessions || convCount) * 200;
+  const clusterStr = clusterCount.toLocaleString();
+
+  return {
+    claudeCount: convCount > 0 ? '[' + convCount + ' conversations]' : '[conversations]',
+    clusterCount: clusterStr,
+  };
+}
 
 /* ── Status message pools ── */
 const MSGS = {
@@ -700,7 +821,7 @@ const MSGS = {
   ],
   done: [
     "Defragmentation complete. Vault is fully optimized.",
-    "All 18,432 clusters processed successfully.",
+    "All clusters processed successfully.",
     "Context successfully consolidated into Obsidian vault.",
     "Press [Optimize] to run again, or [Exit] to quit.",
   ],
@@ -784,12 +905,12 @@ function buildFrame() {
 /* ════════════════════════════════════════════════════════════
    BOOT SEQUENCE
    ════════════════════════════════════════════════════════════ */
-const BOOT_SEQ = [
+// Base boot sequence — source count placeholders replaced at runtime
+const BOOT_SEQ_TEMPLATE = [
   { t:'\n',                                     d:0   },
   { t:'  CTXDEFRAG.EXE\n',                      d:50,  c:'bhi' },
   { t:'  Context Defragmenter v1.0\n',          d:40,  c:'bhi' },
-  { t:'  Copyright (C) 2025 somarc. All rights reserved.\n', d:35 },
-  { t:'  Licensed under MIT License.\n',        d:28 },
+  { t:'  Copyright (C) 2025 context-defrag contributors. MIT License.\n', d:35 },
   { t:'  <https://github.com/somarc/context-defrag>\n', d:28, c:'bdim' },
   { t:'\n',                                     d:20  },
   { t:'  WARNING: Host system is not a PC.\n',  d:60,  c:'bwrn' },
@@ -806,14 +927,14 @@ const BOOT_SEQ = [
   { t:'\n',                                     d:20  },
   { t:'  Scanning context sources...\n',         d:70  },
   { t:'    Found: ~/.claude/projects/     ', d:50 },
-  { t:'[47 conversations]\n',                    d:380, c:'bwrn' },
+  { t:'__CLAUDE_COUNT__\n',                      d:380, c:'bwrn', token:'claudeCount' },
   { t:'    Found: ~/.codex/history        ', d:45 },
   { t:'[12 sessions]\n',                         d:310, c:'bwrn' },
   { t:'    Found: ~/.cursor/workspaces    ', d:45 },
   { t:'[8 projects]\n',                          d:270, c:'bwrn' },
   { t:'\n',                                     d:20  },
   { t:'  Total context size:   2.4 GB\n',        d:60 },
-  { t:'  Total clusters:       18,432\n',        d:40 },
+  { t:'__CLUSTER_LINE__\n',                      d:40,  token:'clusterLine' },
   { t:'  Estimated defrag time: ~90 seconds\n',  d:40 },
   { t:'\n',                                     d:20  },
   { t:'  Verifying disk integrity...             ', d:60 },
@@ -823,6 +944,24 @@ const BOOT_SEQ = [
   { t:'  Press any key to begin defragmentation...\n', d:70, c:'bhi' },
   { t:'',                                        d:0,   cursor:true },
 ];
+
+let BOOT_SEQ = [];
+
+function buildBootSeq() {
+  const real = getRealBootSeq();
+  BOOT_SEQ = BOOT_SEQ_TEMPLATE.map(item => {
+    if (!item.token) return item;
+    const copy = Object.assign({}, item);
+    delete copy.token;
+    if (item.token === 'claudeCount') {
+      copy.t = real ? real.claudeCount + '\n' : '[47 conversations]\n';
+    } else if (item.token === 'clusterLine') {
+      const count = real ? real.clusterCount : '18,432';
+      copy.t = '  Total clusters:       ' + count + '\n';
+    }
+    return copy;
+  });
+}
 
 function startBoot() {
   const el = document.getElementById('boot-scr');
@@ -1039,12 +1178,81 @@ function nextMsg(pool, key) {
 }
 
 /* ════════════════════════════════════════════════════════════
+   VAULT READY PANEL
+   ════════════════════════════════════════════════════════════ */
+function showVaultReady() {
+  if (!realData) return;
+  const stats    = realData.stats    || {};
+  const concepts = realData.concepts || [];
+  const sessions = realData.sessions || [];
+  const output   = realData.output   || realData.vault || '~/vault';
+
+  const sessionCount  = stats.sessions    || stats.conversations || sessions.length || 0;
+  const conceptCount  = stats.concepts    || concepts.length || 0;
+  const linkCount     = stats.links       || stats.wikilinks || 0;
+
+  // Top concepts (up to 5)
+  const topConcepts = concepts.slice(0, 5).map(c =>
+    '[[' + (typeof c === 'string' ? c : c.name || c.title || String(c)) + ']]'
+  );
+  const conceptLine = topConcepts.length > 0
+    ? '    ' + topConcepts.join(' ')
+    : '    (none extracted)';
+
+  const pad = (label, val, w) => {
+    const line = label + String(val);
+    return line + ' '.repeat(Math.max(0, w - line.length));
+  };
+
+  const W = 47; // inner width of box
+  const border = '╔' + '═'.repeat(W) + '╗';
+  const footer = '╚' + '═'.repeat(W) + '╝';
+  const row = (s) => '║  ' + s + ' '.repeat(Math.max(0, W - 2 - s.length)) + '║';
+  const blank = '║' + ' '.repeat(W) + '║';
+
+  const lines = [
+    '╔══ VAULT READY ' + '═'.repeat(W - 15) + '╗',
+    row(pad('Sessions processed:   ', sessionCount, W - 4)),
+    row(pad('Concepts extracted:   ', conceptCount, W - 4)),
+    row(pad('Links created:        ', linkCount,    W - 4)),
+    row(pad('Output: ', output, W - 4)),
+    blank,
+  ];
+
+  if (topConcepts.length > 0) {
+    lines.push(row('Top concepts:'));
+    // wrap concept line if needed
+    const cline = topConcepts.join(' ');
+    if (cline.length <= W - 6) {
+      lines.push(row('  ' + cline));
+    } else {
+      // split into two lines
+      let acc = '';
+      const batches = [];
+      for (const c of topConcepts) {
+        if (acc.length + c.length + 1 > W - 8) { batches.push(acc.trim()); acc = ''; }
+        acc += c + ' ';
+      }
+      if (acc.trim()) batches.push(acc.trim());
+      batches.forEach(b => lines.push(row('  ' + b)));
+    }
+  }
+
+  lines.push(footer);
+
+  const el = document.getElementById('vault-ready');
+  el.textContent = lines.join('\n');
+  el.classList.add('show');
+}
+
+/* ════════════════════════════════════════════════════════════
    PHASE 1: SCAN
    ════════════════════════════════════════════════════════════ */
 function beginScan() {
   phase = PH.SCAN;
   document.getElementById('boot-scr').style.display  = 'none';
   document.getElementById('blk-grid').style.display  = 'grid';
+  document.getElementById('vault-ready').classList.remove('show');
   buildGrid();
   startTimer();
   notes = 0; links = 0; errs = 0; updateCounters();
@@ -1240,6 +1448,10 @@ function doComplete() {
       '[ ✓  CONTEXT FULLY DEFRAGMENTED  —  ' + notes + ' notes  |  ' + links + ' links  ]',
       'var(--green)'
     );
+    // Show vault ready panel if real data was loaded
+    if (realData) {
+      showVaultReady();
+    }
     // Auto-restart loop
     setTimeout(() => {
       speed = 1; // reset speed
@@ -1309,6 +1521,52 @@ document.addEventListener('keydown', (e) => {
 document.getElementById('boot-scr').addEventListener('click', advanceFromBoot);
 
 /* ════════════════════════════════════════════════════════════
+   QMD COPY BUTTON
+   ════════════════════════════════════════════════════════════ */
+const QMD_SETUP_COMMANDS = `# Install QMD
+npm install -g @tobilu/qmd
+
+# Index your vault
+qmd collection add ./vault --name llm-context
+qmd embed
+
+# Search with natural language
+qmd query "what did I decide about the database architecture?"
+qmd vsearch "authentication patterns"`;
+
+function copyQmdSetup() {
+  const btn = document.getElementById('qmd-copy-btn');
+  if (!btn) return;
+  try {
+    navigator.clipboard.writeText(QMD_SETUP_COMMANDS).then(() => {
+      btn.textContent = '[COPIED ✓]';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '[COPY QMD SETUP]';
+        btn.classList.remove('copied');
+      }, 2000);
+    }).catch(() => {
+      // fallback for older browsers
+      const ta = document.createElement('textarea');
+      ta.value = QMD_SETUP_COMMANDS;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      btn.textContent = '[COPIED ✓]';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '[COPY QMD SETUP]';
+        btn.classList.remove('copied');
+      }, 2000);
+    });
+  } catch (_) {}
+}
+window.copyQmdSetup = copyQmdSetup;
+
+/* ════════════════════════════════════════════════════════════
    README
    ════════════════════════════════════════════════════════════ */
 function buildReadme() {
@@ -1359,25 +1617,56 @@ views, and tag taxonomy is available at:
 
   <a href="https://github.com/somarc/context-defrag-vault" target="_blank" rel="noopener">github.com/somarc/context-defrag-vault</a>
 
+<h2>QMD Integration (Semantic Search)</h2>
+<span style="color:var(--white)">══════════════════════════════════════</span>
+
+Pair context-defrag with QMD for full semantic search over your vault:
+
+  <span class="rm-dim"># Install QMD</span>
+  <span class="rm-cmd">npm install -g @tobilu/qmd</span>
+
+  <span class="rm-dim"># Index your vault</span>
+  <span class="rm-cmd">qmd collection add ./vault --name llm-context</span>
+  <span class="rm-cmd">qmd embed</span>
+
+  <span class="rm-dim"># Search with natural language</span>
+  <span class="rm-cmd">qmd query "what did I decide about the database architecture?"</span>
+  <span class="rm-cmd">qmd vsearch "authentication patterns"</span>
+
+  QMD combines BM25 + vector search + local LLM reranking.
+  All on-device. No data leaves your machine.
+
+  → <a href="https://github.com/tobi/qmd" target="_blank" rel="noopener">https://github.com/tobi/qmd</a>
+
+<button id="qmd-copy-btn" class="qmd-copy-btn" onclick="copyQmdSetup()">[COPY QMD SETUP]</button>
+
 <h2>Source + contributing</h2>
   <a href="https://github.com/somarc/context-defrag" target="_blank" rel="noopener">github.com/somarc/context-defrag</a>
 
 <span class="rm-dim">Issues, PRs, and feedback welcome.
 ────────────────────────────────────────────────────────────────────────────────
-context-defrag v1.0  |  MIT License  |  somarc  |  2025
+context-defrag v1.0  |  MIT License  |  2025
 ────────────────────────────────────────────────────────────────────────────────</span>`;
 }
 
 /* ════════════════════════════════════════════════════════════
    INIT
    ════════════════════════════════════════════════════════════ */
-function init() {
+async function init() {
   buildFrame();
   buildReadme();
   // Force font load check so first render isn't ugly
   document.fonts.ready.then(() => {
     buildFrame(); // re-measure with real font metrics
   });
+
+  // Try to load real data before boot sequence starts
+  await loadDefragJson();
+  if (realData) {
+    buildRealMsgPools();
+  }
+  buildBootSeq();
+
   startBoot();
   setProgress(0);
   setStatus('Status: Loading...');

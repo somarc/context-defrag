@@ -1,14 +1,20 @@
 {
   "name": "context-defrag",
   "version": "1.0.0",
-  "description": "Mine LLM session context files from macOS and produce an Obsidian markdown vault",
+  "description": "Mine your LLM session histories (Claude, Codex, Cursor) into a structured Obsidian knowledge vault",
   "main": "cli/defrag.js",
   "bin": {
+    "context-defrag": "./cli/defrag.js",
     "defrag": "./cli/defrag.js"
   },
+  "files": [
+    "cli/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node cli/defrag.js",
-    "defrag": "node cli/defrag.js"
+    "test": "node cli/defrag.js --dry-run --verbose"
   },
   "dependencies": {
     "better-sqlite3": "^9.4.3",
@@ -17,7 +23,27 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "os": ["darwin"],
-  "keywords": ["llm", "obsidian", "context", "cli", "mining"],
-  "license": "MIT"
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "preferGlobal": false,
+  "keywords": [
+    "llm",
+    "claude",
+    "codex",
+    "cursor",
+    "obsidian",
+    "knowledge-management",
+    "cli",
+    "context",
+    "notes",
+    "markdown"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/somarc/context-defrag.git"
+  }
 }

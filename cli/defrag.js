@@ -3,6 +3,7 @@
  * defrag.js — context-defrag CLI entry point
  *
  * Usage:
+ *   npx context-defrag [options]
  *   node cli/defrag.js [options]
  *
  * Options:
@@ -11,13 +12,17 @@
  *   --dry-run          Show what would be extracted without writing
  *   --verbose          Show detailed progress
  *   --since <date>     Only process conversations after this date (ISO 8601)
+ *   --watch            Re-run whenever source files change (2 s debounce)
+ *   --model <name>     LLM model hint stored in defrag.json (informational)
+ *   --gpt-ko           Print QMD integration instructions after writing vault
  *   --help             Show this message
  */
 
 'use strict';
 
-const os   = require('os');
-const path = require('path');
+const fs            = require('fs');
+const path          = require('path');
+const { execFile }  = require('child_process');
 
 // ── Local modules ──────────────────────────────────────────────────────────
 const claudeMiner  = require('./miners/claude');
@@ -38,7 +43,7 @@ const MINER_MAP = {
   cursor: cursorMiner,
 };
 
-// Source display paths — shown in the scan summary
+// Source display paths — shown in the scan summary and written to defrag.json
 const SOURCE_DISPLAY_PATHS = {
   claude: `~/.claude/projects/`,
   codex:  `~/.codex/`,
@@ -54,6 +59,16 @@ async function main() {
     process.exit(0);
   }
 
+  // Run the pipeline once, then set up watch mode if requested
+  await runPipeline(opts);
+
+  if (opts.watch) {
+    setupWatchMode(opts);
+  }
+}
+
+// ── Core pipeline — scan, extract, write ─────────────────────────────────────
+async function runPipeline(opts) {
   printBanner();
 
   // ── Phase 1: Scan sources ───────────────────────────────────────────────
@@ -67,7 +82,7 @@ async function main() {
   }
 
   const allSessions = [];       // { session, extracted }
-  const scanResults = {};       // source → { count, skipped }
+  const scanResults = {};       // source → { found, sessions, path }
 
   for (const source of sources) {
     const miner = MINER_MAP[source];
@@ -81,6 +96,7 @@ async function main() {
       result = await miner.mine({ since: sinceDate, verbose: opts.verbose });
     } catch (err) {
       printStatus('ERR', SOURCE_DISPLAY_PATHS[source], err.message);
+      scanResults[source] = { found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
       continue;
     }
 
@@ -88,12 +104,20 @@ async function main() {
 
     if (skipped && sessions.length === 0) {
       printStatus('--', SOURCE_DISPLAY_PATHS[source], 'Not found, skipping');
+      scanResults[source] = { found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
     } else {
       printStatus('OK', SOURCE_DISPLAY_PATHS[source], `${sessions.length} conversation${sessions.length !== 1 ? 's' : ''} found`);
+      scanResults[source] = { found: true, sessions: sessions.length, path: SOURCE_DISPLAY_PATHS[source] };
     }
 
-    scanResults[source] = { count: sessions.length };
     allSessions.push(...sessions);
+  }
+
+  // Fill in any sources that weren't processed (filtered out via --sources)
+  for (const source of ALL_SOURCES) {
+    if (!(source in scanResults)) {
+      scanResults[source] = { found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
+    }
   }
 
   const totalFound = allSessions.length;
@@ -101,7 +125,7 @@ async function main() {
   if (totalFound === 0) {
     print('');
     print('No conversations found. Nothing to do.');
-    process.exit(0);
+    return;
   }
 
   print('');
@@ -117,7 +141,7 @@ async function main() {
   // ── Phase 3: Extract concepts, decisions, snippets, URLs ────────────────
   print('Extracting concepts...');
 
-  const enriched = [];         // { session, extracted }
+  const enriched = [];          // { session, extracted }
   const conceptFreq = new Map(); // concept → total mention count (for summary)
 
   for (const session of dedupedSessions) {
@@ -198,6 +222,42 @@ async function main() {
 
   print('');
 
+  // ── Phase 6: Write defrag.json manifest ─────────────────────────────────
+  // The manifest connects the CLI output to the web visualizer and QMD integration.
+  const topConceptsList = [...conceptFreq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([c]) => titleCase(c));
+
+  const manifest = {
+    version:     '1.0',
+    generated:   new Date().toISOString(),
+    sources:     scanResults,
+    stats: {
+      sessions:     dedupedSessions.length,
+      concepts:     totalConcepts,
+      snippets:     totalSnippets,
+      urls:         totalUrls,
+      links:        linkStats.linksCreated,
+      filesWritten: writeStats.written,
+    },
+    topConcepts: topConceptsList,
+    vault:       opts.output,
+    ...(opts.model ? { model: opts.model } : {}),
+  };
+
+  if (!opts.dryRun) {
+    try {
+      const manifestPath = path.join(opts.output, 'defrag.json');
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+      if (opts.verbose) {
+        print(`  Manifest written: ${manifestPath}`);
+      }
+    } catch (err) {
+      if (opts.verbose) print(`  [WARN] Could not write defrag.json: ${err.message}`);
+    }
+  }
+
   // ── Final summary ───────────────────────────────────────────────────────
   print('Complete!');
   printStat('Sessions processed', dedupedSessions.length);
@@ -210,6 +270,128 @@ async function main() {
     printStat('Files unchanged',  writeStats.skipped);
   }
   printStat('Output',             opts.output);
+
+  // ── Phase 7: QMD integration ────────────────────────────────────────────
+  if (opts.gptKo) {
+    await runQmdIntegration(opts.output, opts.verbose);
+  }
+}
+
+// ── QMD integration ──────────────────────────────────────────────────────────
+/**
+ * If the `qmd` binary is in PATH, auto-run `qmd collection add`.
+ * Either way, print the instructions for manual use.
+ */
+async function runQmdIntegration(vaultPath, verbose) {
+  print('');
+  print('QMD Integration');
+
+  // Check if qmd binary is available
+  const qmdBin = await findBinary('qmd');
+
+  if (qmdBin) {
+    print(`  Found qmd at: ${qmdBin}`);
+    print(`  Running: qmd collection add "${vaultPath}" --name llm-context`);
+    print('');
+
+    try {
+      const output = await execFilePromise(qmdBin, ['collection', 'add', vaultPath, '--name', 'llm-context']);
+      if (output.stdout) print(output.stdout.trim());
+      if (output.stderr && verbose) print(output.stderr.trim());
+    } catch (err) {
+      print(`  [WARN] qmd collection add failed: ${err.message}`);
+    }
+  }
+
+  // Always print the manual instructions
+  print(`  Run: qmd collection add ${vaultPath} --name llm-context`);
+  print(`       qmd embed`);
+  print(`       qmd query "your question"`);
+}
+
+/**
+ * Locate a binary using the system PATH (cross-platform).
+ * Returns the full path string, or null if not found.
+ */
+function findBinary(name) {
+  return new Promise((resolve) => {
+    // `which` on Unix/macOS; `where` on Windows
+    const cmd     = process.platform === 'win32' ? 'where' : 'which';
+    const cmdArgs = [name];
+
+    execFile(cmd, cmdArgs, (err, stdout) => {
+      if (err || !stdout.trim()) return resolve(null);
+      resolve(stdout.trim().split('\n')[0].trim());
+    });
+  });
+}
+
+/**
+ * Promisified execFile wrapper.
+ */
+function execFilePromise(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: 30000 }, (err, stdout, stderr) => {
+      if (err) return reject(err);
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+// ── Watch mode ────────────────────────────────────────────────────────────────
+/**
+ * Watch all known source directories for changes.
+ * Re-run the full pipeline after a 2-second debounce.
+ */
+function setupWatchMode(opts) {
+  const os = require('os');
+
+  // Directories to watch — all known Claude/Codex/Cursor roots
+  const watchRoots = [
+    path.join(os.homedir(), '.claude'),
+    path.join(os.homedir(), '.config', 'claude'),
+    path.join(os.homedir(), '.codex'),
+    path.join(os.homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'workspaceStorage'),
+  ].filter((p) => {
+    try { return fs.statSync(p).isDirectory(); } catch (_) { return false; }
+  });
+
+  if (watchRoots.length === 0) {
+    print('[watch] No source directories found to watch.');
+    return;
+  }
+
+  print(`[watch] Watching for changes in: ${watchRoots.join(', ')}`);
+
+  let debounceTimer = null;
+
+  for (const root of watchRoots) {
+    try {
+      fs.watch(root, { recursive: true }, (_event, filename) => {
+        // Ignore non-data files (e.g. lock files, .DS_Store)
+        if (filename && (filename.endsWith('.lock') || filename.endsWith('.DS_Store'))) {
+          return;
+        }
+
+        // Debounce: wait 2 seconds after the last change before re-running
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(async () => {
+          debounceTimer = null;
+          print('');
+          print('[watch] Re-running defrag...');
+          try {
+            await runPipeline(opts);
+          } catch (err) {
+            print(`[watch] Pipeline error: ${err.message}`);
+          }
+        }, 2000);
+      });
+    } catch (err) {
+      if (opts.verbose) {
+        print(`[watch] Could not watch ${root}: ${err.message}`);
+      }
+    }
+  }
 }
 
 // ── Argument parser ──────────────────────────────────────────────────────────
@@ -220,6 +402,9 @@ function parseArgs(argv) {
     dryRun:  false,
     verbose: false,
     since:   null,
+    watch:   false,
+    model:   null,
+    gptKo:   false,
     help:    false,
   };
 
@@ -257,6 +442,20 @@ function parseArgs(argv) {
 
       case '--since':
         opts.since = argv[++i];
+        break;
+
+      case '--watch':
+      case '-w':
+        opts.watch = true;
+        break;
+
+      case '--model':
+        opts.model = argv[++i];
+        break;
+
+      case '--gpt-ko':
+      case '--gptko':
+        opts.gptKo = true;
         break;
 
       case '--help':
@@ -321,6 +520,7 @@ context-defrag v${VERSION}
 Mine LLM session context files and produce an Obsidian markdown vault.
 
 USAGE
+  npx context-defrag [options]
   node cli/defrag.js [options]
 
 OPTIONS
@@ -329,18 +529,27 @@ OPTIONS
   --dry-run          Show what would be extracted without writing files
   --verbose          Show detailed progress
   --since <date>     Only process conversations after this date (e.g. 2025-01-01)
+  --watch            Re-run automatically when source files change (2 s debounce)
+  --model <name>     Store a model hint in defrag.json (informational)
+  --gpt-ko           Print QMD indexing instructions; auto-run if qmd is in PATH
   --help             Show this help message
 
 EXAMPLES
-  node cli/defrag.js
-  node cli/defrag.js --output ~/my-vault --sources claude,cursor
-  node cli/defrag.js --since 2025-01-01 --verbose
-  node cli/defrag.js --dry-run --verbose
+  npx context-defrag
+  npx context-defrag --output ~/my-vault --sources claude,cursor
+  npx context-defrag --since 2025-01-01 --verbose
+  npx context-defrag --dry-run --verbose
+  npx context-defrag --watch --output ~/my-vault
+  npx context-defrag --gpt-ko
 
 SOURCES
-  claude   ~/.claude/projects/  (JSONL conversation files)
+  claude   ~/.claude/projects/  (JSONL conversation files — Desktop & Code)
   codex    ~/.codex/            (OpenAI Codex CLI history)
   cursor   ~/Library/Application Support/Cursor/  (SQLite chat history)
+
+OUTPUT
+  After each run, <vault>/defrag.json is written with session counts, top
+  concepts, and source metadata — usable by the web visualizer and QMD.
 `.trim());
 }
 

@@ -17,8 +17,11 @@
 5. [Note Naming and Slug Generation](#note-naming-and-slug-generation)
 6. [Wikilink Resolution](#wikilink-resolution)
 7. [Idempotency](#idempotency)
-8. [Vault Structure Decisions](#vault-structure-decisions)
-9. [Extension Points](#extension-points)
+8. [The `defrag.json` Manifest](#the-defragjson-manifest)
+9. [Visualizer ↔ CLI Connection](#visualizer--cli-connection)
+10. [Vault Structure Decisions](#vault-structure-decisions)
+11. [QMD Integration](#qmd-integration)
+12. [Extension Points](#extension-points)
 
 ---
 
@@ -32,29 +35,32 @@ Each stage is independently testable and isolated behind a clean interface. Mine
   ┌──────────────────────────────────────────────────────────────┐
   │                        CLI (defrag.js)                       │
   └───────────────────────────┬──────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-        ClaudeMiner      CodexMiner      CursorMiner
-              │               │               │
-              └───────────────┼───────────────┘
-                              ▼
-                    ConversationRecord[]          ← normalized IR
-                              │
-                              ▼
-                     ExtractionEngine
-                    (concepts, summaries,
-                     code snippets, dates)
-                              │
-                              ▼
-                       NoteGraph                 ← in-memory graph
-                    (nodes + edges)
-                              │
-                              ▼
-                    WikilinkResolver
-                              │
-                              ▼
-                        VaultWriter              ← disk I/O
+                               │
+               ┌───────────────┼───────────────┐
+               ▼               ▼               ▼
+         ClaudeMiner      CodexMiner      CursorMiner
+               │               │               │
+               └───────────────┼───────────────┘
+                               ▼
+                     ConversationRecord[]          ← normalized IR
+                               │
+                               ▼
+                      ExtractionEngine
+                     (concepts, summaries,
+                      code snippets, dates)
+                               │
+                               ▼
+                        NoteGraph                 ← in-memory graph
+                     (nodes + edges)
+                               │
+                               ▼
+                     WikilinkResolver
+                               │
+                               ▼
+                         VaultWriter              ← disk I/O
+                               │
+                               ▼
+                       defrag.json               ← manifest
 ```
 
 ---
@@ -101,19 +107,21 @@ interface Message {
 
 The extraction engine runs each `ConversationRecord` through a set of extractors:
 
-| Extractor         | Output                                |
-|-------------------|---------------------------------------|
-| `SummaryExtractor`   | One-paragraph session summary      |
-| `ConceptExtractor`   | Array of concept slugs             |
-| `CodeExtractor`      | Fenced code blocks with language   |
-| `DecisionExtractor`  | Explicit decisions / conclusions   |
-| `DateExtractor`      | Canonical date for the session     |
+| Extractor           | Output                                |
+|---------------------|---------------------------------------|
+| `SummaryExtractor`  | One-paragraph session summary         |
+| `ConceptExtractor`  | Array of concept slugs                |
+| `CodeExtractor`     | Fenced code blocks with language      |
+| `DecisionExtractor` | Explicit decisions / conclusions      |
+| `DateExtractor`     | Canonical date for the session        |
 
 Extraction is heuristic and does not require an LLM. `ConceptExtractor` uses a combination of frequency analysis, noun-phrase chunking (via `compromise`), and a configurable concept dictionary. For sessions where the assistant produces structured output (e.g., markdown headers), header text is also promoted to concept candidates.
 
 ### Stage 4 — Write
 
 The `VaultWriter` takes the fully-resolved `NoteGraph` and writes Markdown files. It computes a diff against the existing vault (if `--update` is set) and only writes files that have changed. New files are always written; existing files are updated if their content hash differs.
+
+After writing, the vault writer updates `defrag.json` with provenance records for every note it touched.
 
 ---
 
@@ -180,7 +188,7 @@ The `cwd` field is used as the project slug after path normalization.
 ```json
 {
   "id": "sess_19a",
-  "cwd": "/Users/somarc/projects/myapp",
+  "cwd": "/Users/username/projects/myapp",
   "createdAt": 1715705021,
   "messages": [
     {"role": "user", "content": "..."},
@@ -214,7 +222,7 @@ const workspacePath = await db.get(
 SELECT key, value FROM ItemTable
 WHERE key LIKE 'aiService.chat%';
 
--- Inline edit sessions  
+-- Inline edit sessions
 SELECT key, value FROM ItemTable
 WHERE key LIKE 'aiService.generations%';
 ```
@@ -223,9 +231,9 @@ The `value` column contains JSON-encoded chat history. Message shapes vary acros
 
 **Known variants:**
 
-| Cursor Version | `role` field    | Content field     |
-|----------------|-----------------|-------------------|
-| < 0.40         | `"human"` / `"ai"` | `"text"`       |
+| Cursor Version | `role` field           | Content field |
+|----------------|------------------------|---------------|
+| < 0.40         | `"human"` / `"ai"`     | `"text"`      |
 | 0.40+          | `"user"` / `"assistant"` | `"content"` |
 
 The miner maps both to the canonical `"user"` / `"assistant"` roles.
@@ -384,6 +392,96 @@ Worth reading [[the-book-ch4]] before returning to this.
 
 ---
 
+## The `defrag.json` Manifest
+
+After each run, `context-defrag` writes a `defrag.json` file to the vault root. This manifest is the source of truth for incremental updates, visualizer data, and QMD integration.
+
+### Schema
+
+```json
+{
+  "version": 1,
+  "lastRun": "2025-05-16T17:00:00Z",
+  "stats": {
+    "sessionsRead": 47,
+    "conceptsExtracted": 234,
+    "notesWritten": 189,
+    "wikilinksCreated": 891
+  },
+  "sources": {
+    "claude": {
+      "lastProcessed": "2025-05-16T17:00:00Z",
+      "recordCount": 31
+    },
+    "cursor": {
+      "lastProcessed": "2025-05-16T17:00:00Z",
+      "recordCount": 12
+    },
+    "codex": {
+      "lastProcessed": "2025-05-16T17:00:00Z",
+      "recordCount": 4
+    }
+  },
+  "records": [
+    {
+      "sourceId": "proj_k9x2m4r8/conversation.jsonl",
+      "source": "claude",
+      "noteSlug": "2025-05-14-my-rust-project",
+      "notePath": "sessions/2025-05-14-my-rust-project.md",
+      "contentHash": "sha256:7a3f9c...",
+      "processedAt": "2025-05-16T17:00:00Z"
+    }
+  ]
+}
+```
+
+### Field reference
+
+| Field | Description |
+|-------|-------------|
+| `version` | Manifest schema version. Currently `1`. |
+| `lastRun` | ISO 8601 timestamp of the most recent complete run. |
+| `stats` | Aggregate counts for the last run. |
+| `sources[name].lastProcessed` | Timestamp of last successful mine for this source. Used by `--since` filtering on incremental runs. |
+| `records[]` | One entry per source conversation that was processed. `contentHash` is compared on re-run to detect changes. |
+
+### Incremental updates
+
+When `--update` is set, the CLI loads `defrag.json` on startup. For each source file found by the scanner, it looks up the existing `contentHash`. If the hash matches, the file is skipped entirely — the miner never reads it. This makes re-runs on large vaults fast.
+
+---
+
+## Visualizer ↔ CLI Connection
+
+The terminal visualizer is driven by a shared event emitter that the CLI publishes to as it processes each cluster. The visualizer subscribes and updates the display in real time.
+
+```js
+// src/events.js
+export const defragEvents = new EventEmitter();
+
+// Events emitted during a run:
+// 'cluster:reading'   { source, path, index, total }
+// 'cluster:writing'   { noteSlug, notePath }
+// 'cluster:linked'    { noteSlug, links: string[] }
+// 'cluster:done'      { noteSlug }
+// 'run:complete'      { stats }
+```
+
+The visualizer (`src/visualizer.js`) consumes these events to:
+
+1. Advance the progress bar block by block
+2. Update the "Reading:" / "Writing:" / "Links:" status lines
+3. Transition block characters from `░` → `▓` → `█` → `■` as each cluster moves through the pipeline
+4. Write final stats on `run:complete`
+
+The **GitHub Pages demo** replays a pre-recorded `defrag.json` from a sample run, animating the same block transitions at a fixed tick rate. The demo HTML file reads `defrag.json` and reconstructs the full block grid from the `records` array, so the demo is always structurally accurate to a real run.
+
+### Visualizer in non-TTY environments
+
+When stdout is not a TTY (e.g., CI, piped output), the visualizer is automatically suppressed and replaced with plain log lines. Pass `--no-visualizer` to force this behavior in any environment.
+
+---
+
 ## Vault Structure Decisions
 
 ### Why a flat `concepts/` directory?
@@ -426,6 +524,60 @@ defrag-id: sha256:bb1e2d...
 defrag-updated: 2025-05-16T17:00:00Z
 ---
 ```
+
+---
+
+## QMD Integration
+
+[QMD](https://github.com/your-username/qmd) is the semantic search companion to `context-defrag`. It indexes the vault output and exposes a query interface. This section documents how the two tools connect.
+
+### How QMD reads the vault
+
+QMD discovers vault content by reading `defrag.json` at the vault root. It uses the `records` array to build its initial document list (rather than scanning the filesystem), which ensures it only indexes notes generated by `context-defrag` and respects the content-hash for incremental index updates.
+
+```json
+// defrag.json → QMD index mapping
+{
+  "records": [
+    {
+      "noteSlug": "2025-05-14-my-rust-project",
+      "notePath": "sessions/2025-05-14-my-rust-project.md",
+      "contentHash": "sha256:7a3f9c..."
+    }
+  ]
+}
+```
+
+QMD reads each `notePath`, strips frontmatter and `<!-- defrag:end -->` user content, and indexes the structured body text.
+
+### Collections
+
+QMD organizes vault notes into collections matching the vault's directory structure:
+
+| Vault directory | QMD collection | Notes |
+|-----------------|----------------|-------|
+| `sessions/`     | `sessions`     | Indexed by date + project |
+| `concepts/`     | `concepts`     | Indexed by slug + session list |
+| `projects/`     | `projects`     | Indexed by project name |
+| `snippets/`     | `snippets`     | Code only; language-aware tokenization |
+
+### Incremental indexing
+
+`qmd index --update ./vault` reads `defrag.json` and compares `contentHash` values against its own stored hashes. Notes where the hash is unchanged are skipped. This means a `qmd index --update` after a `context-defrag --update` only re-indexes the notes that actually changed.
+
+### Frontmatter as structured metadata
+
+QMD uses frontmatter fields as queryable structured metadata alongside the full-text index. This enables filtered queries:
+
+```bash
+# All sessions from Claude that mention rust-lifetimes
+qmd query "lifetime error" --source claude --concept rust-lifetimes
+
+# Sessions from the last 30 days
+qmd query "borrow checker" --since 30d
+```
+
+The `concepts`, `source`, `project`, and `date` frontmatter fields are indexed as filterable facets.
 
 ---
 
@@ -474,3 +626,7 @@ Register in `src/extractors/index.js`.
 ### Custom concept dictionaries
 
 Place a `concepts.json` array in the project root or pass `--concepts path/to/concepts.json`. Entries are matched case-insensitively and bypass the frequency threshold.
+
+```json
+["borrow checker", "async runtime", "CRDT", "distributed systems", "Byzantine fault"]
+```
