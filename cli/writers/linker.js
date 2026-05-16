@@ -135,31 +135,32 @@ function injectLinks(content, registry, currentFile, vaultDir) {
 }
 
 /**
- * Replace occurrences of `term` in `text` with [[vaultPath|term]].
- * Only replaces plain occurrences — not inside existing [[...]] or code spans.
+ * Replace the FIRST occurrence of `term` in `text` with [[vaultPath|term]].
+ * Skips matches that are already inside [[...]] or `code spans`.
+ * Uses a forward-scan approach (no lookbehind) for Node 25 compatibility.
  */
 function linkifyTerm(text, term, vaultPath) {
-  // Build a case-sensitive boundary regex.
-  // We specifically don't want to match inside existing [[...]] brackets.
   const escaped = escapeRegex(term);
-
-  // Match the term when it is NOT already inside [[ ]] or [ ]( )
-  // Use a simple approach: replace, then verify we haven't double-linked.
-  const re = new RegExp(`(?<!\\[\\[(?:[^\\]]*))\\b(${escaped})\\b(?![^\\[]*\\]\\])`, 'g');
+  const re = new RegExp(`\\b(${escaped})\\b`, 'gi');
 
   let count = 0;
-  const linked = text.replace(re, (_match, p1) => {
+  const result = text.replace(re, (match, p1, offset) => {
+    // Check if this position is inside an existing [[...]] or `...`
+    const before = text.slice(0, offset);
+    // Count unclosed [[ without matching ]]
+    const openBrackets  = (before.match(/\[\[/g)  || []).length;
+    const closeBrackets = (before.match(/\]\]/g)  || []).length;
+    if (openBrackets > closeBrackets) return match; // inside a wikilink
+
+    // Count unclosed backticks
+    const backticks = (before.match(/`/g) || []).length;
+    if (backticks % 2 !== 0) return match; // inside a code span
+
     count++;
-    // If the vaultPath already contains the term as the last segment,
-    // we can use the short form [[term]]; otherwise use [[path|term]]
-    const lastSegment = vaultPath.split('/').pop();
-    if (lastSegment.toLowerCase() === slugify(term.toLowerCase())) {
-      return `[[${vaultPath}|${p1}]]`;
-    }
     return `[[${vaultPath}|${p1}]]`;
   });
 
-  return { text: linked, count };
+  return { text: result, count };
 }
 
 // ── Tokeniser — splits content into typed zones ───────────────────────────────

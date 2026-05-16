@@ -49,12 +49,47 @@ const TECH_KEYWORDS = new Set([
   'aem','adobe','jackrabbit','oak','jcr','osgi','sling','wcm','dam','dispatcher',
   'replication','workflow','cq','content fragment','experience fragment',
 
-  // Protocols / formats
-  'rest','grpc','websocket','http','https','oauth','jwt','saml','oidc',
+  // Protocols / formats (note: http/https excluded — too noisy as standalone terms)
+  'rest','grpc','websocket','oauth','jwt','saml','oidc',
   'json','yaml','toml','protobuf','avro','parquet','arrow','csv','xml',
 
   // Misc
   'obsidian','markdown','git','npm','yarn','pnpm','bun','node','deno','nix',
+]);
+
+// ── Canonical display forms for acronyms / known-casing terms ───────────────
+// Keys must match the lowercase entries in TECH_KEYWORDS exactly.
+const KEYWORD_DISPLAY = {
+  'aem':'AEM','jcr':'JCR','osgi':'OSGi','wcm':'WCM','dam':'DAM','cq':'CQ',
+  'aws':'AWS','gcp':'GCP','iam':'IAM','ec2':'EC2','s3':'S3','rds':'RDS',
+  'ecs':'ECS','eks':'EKS','cdn':'CDN',
+  'json':'JSON','yaml':'YAML','xml':'XML','csv':'CSV','sql':'SQL',
+  'graphql':'GraphQL','grpc':'gRPC','rest':'REST','oauth':'OAuth',
+  'jwt':'JWT','saml':'SAML','oidc':'OIDC','api':'API','sdk':'SDK',
+  'cli':'CLI','llm':'LLM','rag':'RAG','npm':'npm','css':'CSS','html':'HTML',
+  'wasm':'WASM','k8s':'k8s','dbt':'dbt','lora':'LoRA','qlora':'QLoRA',
+  'vllm':'vLLM','gguf':'GGUF','ggml':'GGML',
+  'nextjs':'Next.js','nestjs':'NestJS','nuxt':'Nuxt','fastapi':'FastAPI',
+  'postgresql':'PostgreSQL','mongodb':'MongoDB','elasticsearch':'Elasticsearch',
+  'cloudflare':'Cloudflare','github':'GitHub','gitlab':'GitLab',
+  'bitbucket':'Bitbucket','figma':'Figma','openai':'OpenAI',
+  'anthropic':'Anthropic','claude':'Claude','pytorch':'PyTorch',
+  'tensorflow':'TensorFlow','scikit-learn':'scikit-learn',
+  'langchain':'LangChain','llamaindex':'LlamaIndex','huggingface':'HuggingFace',
+  'obsidian':'Obsidian','markdown':'Markdown','typescript':'TypeScript',
+  'javascript':'JavaScript','python':'Python','kotlin':'Kotlin','swift':'Swift',
+  'golang':'Go','webassembly':'WebAssembly','powershell':'PowerShell',
+};
+
+// ── Terms that are too generic / noisy to be useful concepts ────────────────
+const CONCEPT_STOPWORDS = new Set([
+  'http','https','null','true','false','undefined','const','let','var',
+  'function','return','class','import','export','default','async','await',
+  'error','warning','info','debug','test','type','data','value','result',
+  'object','array','string','number','boolean','file','path','name','key',
+  'index','items','list','node','root','base','core','main','util','utils',
+  'helper','helpers','service','services','handler','handlers','config',
+  'options','params','args','props','state','store','model','schema',
 ]);
 
 // ── Sentences that signal a decision ────────────────────────────────────────
@@ -97,14 +132,15 @@ function extractConcepts(text) {
   for (const [, term] of text.matchAll(BACKTICK_RE)) {
     const t = term.trim();
     if (t.length < 2 || t.includes('\n')) continue;
+    if (CONCEPT_STOPWORDS.has(t.toLowerCase())) continue;
     bump(freq, t.toLowerCase(), t);
   }
 
-  // 2. Known tech keywords (case-insensitive)
+  // 2. Known tech keywords (case-insensitive) — preserve canonical display form
   const words = text.toLowerCase().split(/\W+/);
   for (const w of words) {
     if (TECH_KEYWORDS.has(w)) {
-      bump(freq, w, w);
+      bump(freq, w, KEYWORD_DISPLAY[w] || w);
     }
   }
 
