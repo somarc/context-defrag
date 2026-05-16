@@ -7,26 +7,26 @@
 
 ## Table of Contents
 
-1. [Philosophy](#philosophy)
-2. [Pipeline Overview](#pipeline-overview)
-3. [Signal Scoring](#signal-scoring)
-4. [Excerpt Ranking](#excerpt-ranking)
-5. [Session Narrative Construction](#session-narrative-construction)
-6. [Tiered Note Creation](#tiered-note-creation)
-7. [The Linker](#the-linker)
-8. [Source Formats](#source-formats)
+1. [Philosophy](#1-philosophy)
+2. [Pipeline Overview](#2-pipeline-overview)
+3. [Signal Scoring](#3-signal-scoring)
+4. [Excerpt Ranking](#4-excerpt-ranking)
+5. [Session Narrative Construction](#5-session-narrative-construction)
+6. [Tiered Note Creation](#6-tiered-note-creation)
+7. [The Linker](#7-the-linker)
+8. [Source Formats](#8-source-formats)
    - [Claude Miner](#claude-miner)
    - [Cursor Miner](#cursor-miner)
    - [Codex CLI Miner](#codex-cli-miner)
-9. [Idempotency](#idempotency)
-10. [The `defrag.json` Manifest](#the-defragjson-manifest)
-11. [Vault Structure Decisions](#vault-structure-decisions)
-12. [QMD Integration](#qmd-integration)
-13. [Extension Points](#extension-points)
+9. [Idempotency](#9-idempotency)
+10. [The `defrag.json` Manifest](#10-the-defragjson-manifest)
+11. [Vault Structure Decisions](#11-vault-structure-decisions)
+12. [QMD Integration](#12-qmd-integration)
+13. [Extension Points](#13-extension-points)
 
 ---
 
-## Philosophy
+## 1. Philosophy
 
 ### The core problem
 
@@ -42,7 +42,7 @@ The tool produces two distinct layers, each optimized for a different access pat
 
 **Vault layer** (`concepts/`, `sessions/`, `code/`, `links.md`, `_timeline.md`): structured, human-readable Markdown optimized for Obsidian's graph navigation and manual curation. A human can open this vault, browse the graph, click into a concept note, and immediately see every session where that concept was discussed, every decision made about it, and every related concept. The vault is the primary interface. It is designed for exploration, not just search.
 
-**Search layer** (QMD): a semantic index over the vault, consumed programmatically by [QMD](https://github.com/your-username/qmd). QMD reads `defrag.json` to discover the vault contents, indexes the structured body text, and exposes filtered queries like `qmd query "replication retry" --source claude --since 30d`. The search layer is for retrieval when you know roughly what you're looking for but don't want to browse.
+**Search layer** (QMD): a semantic index over the vault, consumed programmatically. QMD reads `defrag.json` to discover the vault contents, indexes the structured body text, and exposes filtered queries like `qmd query "replication retry" --source claude --since 30d`. The search layer is for retrieval when you know roughly what you're looking for but don't want to browse.
 
 These layers complement each other. The vault is for discovery and serendipitous connection. QMD is for targeted lookup. Neither alone is sufficient.
 
@@ -52,7 +52,7 @@ The extraction pipeline is entirely heuristic — regex patterns, keyword matchi
 
 **Speed**: heuristic extraction runs a full corpus of 200 sessions in 3–5 seconds. An LLM summarization pass at one call per session would take 10–20 minutes, even with parallelism.
 
-**Privacy**: the user's conversation history stays on their machine. No bytes of chat history leave the local process. Many users run this tool on codebases, codebases that contain proprietary logic, credentials in prompts, and unreleased product details.
+**Privacy**: the user's conversation history stays on their machine. No bytes of chat history leave the local process. Many users run this tool on codebases that contain proprietary logic, credentials in prompts, and unreleased product details.
 
 **Reproducibility**: heuristics are deterministic. The same input always produces the same output. This makes re-runs predictable and diffing meaningful — if a note changed between runs, it's because the source data changed, not because an LLM chose different phrasing.
 
@@ -64,15 +64,15 @@ The extraction pipeline is entirely heuristic — regex patterns, keyword matchi
 2. The vault is designed to be curated by the user, not consumed blindly.
 3. LLM summarization is available as an opt-in `--synthesize` flag (planned) for users who want to upgrade specific concept notes after initial extraction.
 
-The philosophy is: run the cheap pass first, get 80% of the value immediately, and let users opt into the expensive pass for the notes that matter most.
+The philosophy: run the cheap pass first, get 80% of the value immediately, and let users opt into the expensive pass for the notes that matter most.
 
 ---
 
-## Pipeline Overview
+## 2. Pipeline Overview
 
 Context Defrag is a seven-phase pipeline: **scan → deduplicate → extract → write → link → manifest → QMD**.
 
-Each phase is independently scoped. Miners produce a normalized intermediate representation. The extraction engine operates only on that normalized form — it has no knowledge of source formats. The writer consumes extracted data. The linker runs as a post-processing pass over the written vault.
+Each phase is independently scoped. Miners produce a normalized intermediate representation. The extraction engine operates only on that normalized form — it has no knowledge of source formats. The writer consumes extracted data. The linker runs as a post-processing pass over the written vault. This separation of concerns means each component can be tested, replaced, or extended in isolation.
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
@@ -88,81 +88,110 @@ Each phase is independently scoped. Miners produce a normalized intermediate rep
               │               │               │
               └───────────────┼───────────────┘
                               ▼
-                    Session[]                       ← normalized objects
+                    Session[]                        ← normalized objects
                   { source, id, title,
                     timestamp, messages[],
                     turnCount, filePath }
                               │
                               ▼
-                    deduplicateSessions()           ← ID-based dedup
+                    deduplicateSessions()            ← FNV-1a ID-based dedup
                               │
                               ▼
-                    extract(session)                ← per-session
+                    extract(session)                 ← per-session, pure function
                   { concepts[], decisions[],
                     snippets[], urls[],
                     entities[] }
                               │
                               ▼
-                    enriched[]                      ← { session, extracted }
-                  { session, extracted }
+                    enriched[]                       ← { session, extracted }
+                              │
+              ┌───────────────┼──────────────────────────────────┐
+              │               │                                  │
+              ▼               ▼                                  ▼
+      sessions/*.md    concepts/*.md               _low-signal.md
+                        (score ≥ threshold)         (score < threshold)
+              │               │                                  │
+              └───────────────┼──────────────────────────────────┘
+                              │
+                    code/*.md  links.md  _timeline.md  _index.md
                               │
                               ▼
-              ┌───────────────┼──────────────────────────┐
-              │               │                          │
-              ▼               ▼                          ▼
-      session notes    concept notes            code / links /
-      sessions/*.md    concepts/*.md            timeline / index
-              │               │                          │
-              └───────────────┼──────────────────────────┘
-                              ▼
-                    writeNote()                     ← idempotent
-                    (content-hash diff)
+                    writeNote()                      ← idempotent, sentinel-aware
                               │
                               ▼
-                    link()                          ← post-process
-                    (wikilink injection)
+                    link({ vaultDir })               ← post-processing pass
+                    buildRegistry() → injectLinks()
                               │
                               ▼
-                    defrag.json                     ← manifest
+                    defrag.json                      ← manifest
+                              │
+                              ▼
+                    [optional] qmd collection add    ← if --gpt-ko
 ```
 
 ### Phase 1 — Scan
 
-`defrag.js` iterates over the requested source names (`claude`, `codex`, `cursor`), calls `miner.mine({ since, verbose })` on each, and accumulates `Session[]` results. Errors are caught per-miner — a broken Cursor installation does not abort Claude mining.
-
-The `--since <date>` flag is passed to miners at this stage. Miners apply date filtering before returning sessions, so the extraction phase never sees stale data.
+`defrag.js` iterates over the requested source names (`claude`, `codex`, `cursor`), calls `miner.mine({ since, verbose })` on each, and accumulates results. Errors are caught per-miner — a broken Cursor installation does not abort Claude mining. The `--since <date>` flag is passed to miners at this stage; miners apply date filtering before returning, so the extraction phase never sees stale data.
 
 ### Phase 2 — Deduplicate
 
-After all miners return, sessions are deduplicated by `session.id`. Each miner computes IDs deterministically from file paths (FNV-1a hash), so the same conversation file discovered through multiple search roots (e.g. via symlinks or both `.claude/` and `Library/Application Support/Claude/`) produces a single session.
+After all miners return, `deduplicateSessions()` filters by `session.id`. Each miner computes IDs deterministically using FNV-1a hashes of file paths, so the same conversation file discovered through multiple search roots (e.g. via symlinks or both `.claude/` and `Library/Application Support/Claude/`) produces a single session object.
+
+```js
+function deduplicateSessions(sessions) {
+  const seen = new Set();
+  return sessions.filter((session) => {
+    if (seen.has(session.id)) return false;
+    seen.add(session.id);
+    return true;
+  });
+}
+```
 
 ### Phase 3 — Extract
 
-`extract(session)` runs on each deduplicated session. It operates on the full concatenated message text and produces a flat extracted object (see [Extraction Engine](#extraction-engine) below). The per-session extracted results are accumulated into `conceptFreq` — a Map used later to compute cross-session concept frequency.
+`extract(session)` in `extractor.js` runs on each deduplicated session. It operates on the full concatenated message text and produces a flat extracted object. The function is a pure data transformation — no I/O, no side effects. This makes it trivially testable and safely runnable in parallel (if a future version opts to parallelize).
+
+```js
+function extract(session) {
+  const fullText = session.messages.map((m) => m.content).join('\n\n');
+  return {
+    concepts:  extractConcepts(fullText),
+    decisions: extractDecisions(session.messages),
+    snippets:  extractSnippets(fullText),
+    urls:      extractUrls(fullText),
+    entities:  extractEntities(fullText),
+  };
+}
+```
+
+Per-session extracted results are accumulated into `conceptFreq` — a `Map` used to build the final manifest's `topConcepts` list.
 
 ### Phase 4 — Write (vault)
 
-`write({ outputDir, sessions: enriched, dryRun, verbose })` creates all output files. It is responsible for the vault's directory structure and file content. The `writeNote()` helper inside is idempotent: if the file already exists and content is identical, it is skipped (`stats.skipped++`). Otherwise it is overwritten (`stats.written++`).
+`write({ outputDir, sessions, dryRun, verbose, signalThreshold })` in `obsidian.js` creates all output files. It owns the vault's directory structure and renders all note content. The `writeNote()` helper is idempotent: if a file already exists, it checks for the `<!-- defrag:end -->` sentinel and merges user-authored content below it with freshly generated content above it (see [Idempotency](#9-idempotency)).
+
+Write order matters: session notes are written first (they don't reference concept notes), then concept notes (which reference sessions), then structural files (_low-signal, code snippets, links, timeline, index).
 
 ### Phase 5 — Link
 
-`link({ vaultDir, dryRun, verbose })` runs as a separate post-processing pass over the written vault. It builds a registry of all note titles, then injects `[[wikilinks]]` into the text zones of each note. Running this as a separate pass (not inline during write) simplifies the writer: notes can reference each other without needing to know during write time whether the target note will exist.
+`link({ vaultDir, dryRun, verbose })` in `linker.js` runs as a separate post-processing pass over the completed vault. It builds a registry of all note titles, then injects `[[wikilinks]]` into the text zones of each note. Running this as a separate pass — not inline during write — means notes can reference each other without needing to know during write time whether the target note will exist.
 
 ### Phase 6 — Manifest
 
-`defrag.json` is written to the vault root with aggregate statistics, source metadata, and the top concepts list. This file is the handshake between the CLI, the web visualizer, and QMD.
+`defrag.json` is written to the vault root with aggregate statistics, source metadata, and the top concepts list. This file is the handshake between the CLI, the web visualizer, and QMD (see [The defrag.json Manifest](#10-the-defragjson-manifest)).
 
 ### Phase 7 — QMD Integration (optional)
 
-If `--gpt-ko` is passed, the CLI attempts to auto-invoke `qmd collection add` if the `qmd` binary is in `PATH`. Whether or not the binary is found, it prints the manual QMD integration instructions.
+If `--gpt-ko` is passed, the CLI attempts to auto-invoke `qmd collection add` if the `qmd` binary is in `PATH`. Whether or not the binary is found, it prints manual QMD integration instructions.
 
 ### Watch mode
 
-`--watch` keeps the process running after the first pipeline completion. It uses `fs.watch()` with `{ recursive: true }` on all detected source directories and re-runs the full pipeline after a 2-second debounce. The debounce prevents thrashing when an LLM client writes multiple files in rapid succession (common when Claude Code streams a long session). `.lock` and `.DS_Store` changes are filtered out at the watch event handler.
+`--watch` keeps the process running after the first pipeline completion. It uses `fs.watch()` with `{ recursive: true }` on all detected source directories and re-runs the full pipeline after a 2-second debounce. The debounce prevents thrashing when an LLM client writes multiple files in rapid succession (common when Claude Code streams a long session). `.lock` and `.DS_Store` changes are filtered at the watch event handler level before the debounce timer is started.
 
 ---
 
-## Signal Scoring
+## 3. Signal Scoring
 
 Signal scoring is the most architecturally important part of the extraction system. It is the mechanism that separates meaningful concepts from noise.
 
@@ -192,17 +221,24 @@ function computeSignalScore(concept, sessionItems) {
 
   for (const item of sessionItems) {
     const { session, extracted } = item;
+
+    // Only count sessions where this concept was extracted
     const appearsInSession = (extracted.concepts || []).some(
       (c) => c.toLowerCase() === conceptLower
     );
     if (!appearsInSession) continue;
 
     sessionCount++;
+
+    // Count decision sentences that mention this concept
     for (const d of (extracted.decisions || []))
       if (re.test(d)) decisionCount++;
+
+    // Count code snippets whose body references this concept
     for (const s of (extracted.snippets || []))
       if (s && s.code && re.test(s.code)) codeCount++;
 
+    // Track distinct workspaces/sources
     if (session.source)        projectSources.add(session.source);
     if (session.workspacePath) projectSources.add(session.workspacePath);
   }
@@ -212,158 +248,185 @@ function computeSignalScore(concept, sessionItems) {
 }
 ```
 
+Note the guard: a concept is only counted for a session if it actually appears in that session's `extracted.concepts` list. This prevents false positives from the word-boundary regex matching incidental substrings.
+
 ### Weight rationale
 
 **`sessionCount × 2` — Raw frequency (lowest weight)**
 
-Session count is a necessary but weak signal. A concept appearing in many sessions just means it's common in your stack — not that it's worth a dedicated note. "JavaScript" might appear in every session, but "JavaScript" is not a useful concept note. The weight is 2 rather than 1 because multiple sessions do provide mild evidence that the concept is recurring, but it needs to be combined with other signals to matter. Consider this the "at least it's not one-off" contribution.
+Session count is necessary but weak. A concept appearing in many sessions just means it's common in your stack, not that it's worth a dedicated note. "JavaScript" might appear in every session, but "JavaScript" is not a useful concept note for most developers — it's so ubiquitous it carries no signal about your actual thinking. The weight is 2 rather than 1 because multiple sessions do provide mild evidence of recurrence, but only in combination with other signals does it matter. Think of this as the "at least it's not one-off" contribution.
 
 **`decisionCount × 5` — Explicit decisions (highest weight)**
 
-Decision sentences are the gold. "We chose SQLite over Postgres because we need zero-dep distribution" — that sentence represents crystallized reasoning that took real effort to arrive at. It encodes a tradeoff. It would be painful to re-derive. If a concept appears in decision language across your sessions, it was worth reasoning about explicitly, which means it's worth preserving explicitly.
+Decision sentences are the gold standard. "We chose SQLite over Postgres because we need zero-dep distribution" — that sentence represents crystallized reasoning that took real effort to arrive at. It encodes a tradeoff. It would be painful to re-derive. If a concept appears in decision language across your sessions, it was worth reasoning about explicitly, which means it's worth preserving explicitly.
 
-The 5× weight reflects this: one decision sentence is worth more than two raw session appearances. A concept with a single decision hit scores `(1×2) + (1×5) = 7`, which is near (but below) the default threshold — signaling that a concept discussed once with one explicit decision is on the boundary of being notable.
+The 5× weight reflects this primacy: one decision sentence is worth more than two raw session appearances. A concept discussed once with one explicit decision scores `(1×2) + (1×5) = 7`, which sits just below the default threshold — it's on the boundary of being notable but hasn't quite earned standalone status. Two sessions with one decision: `(2×2) + (1×5) = 9`. Threshold crossed.
 
 **`codeCount × 3` — Code co-occurrence (medium-high weight)**
 
-When a concept appears in both conversation text and code snippets within the same session, the concept has moved from discussion into implementation. It is being actively used, not just talked about. A concept that only appears in prose might be speculative; one that appears in code is operational.
+When a concept appears in both conversation text and extracted code snippets within the same session, the concept has moved from discussion into implementation. It is being actively used, not just talked about. A concept that only appears in prose might be speculative or exploratory; one that appears in code is operational.
 
-Weight 3 is higher than session frequency (2) because code evidence is more concrete, but lower than decisions (5) because code presence doesn't mean the concept was *understood* — sometimes concepts appear in code snippets incidentally.
+Weight 3 is higher than session frequency (2) because code evidence is more concrete — it means the concept was implemented, not just considered. It is lower than decisions (5) because code presence doesn't mean the concept was *understood*: sometimes concepts appear in code snippets incidentally, as part of a longer example that happened to include the term.
 
 **`crossProjectCount × 4` — Cross-workspace relevance (near-highest weight)**
 
-`crossProjectCount` is built from the set of distinct `session.source` and `session.workspacePath` values across all sessions mentioning the concept. A concept that spans multiple projects or workspaces is a genuine cross-cutting concern in your work.
+`crossProjectCount` is built from the set of distinct `session.source` values and `session.workspacePath` values across all sessions mentioning the concept. A concept that spans multiple projects or workspaces is a genuine cross-cutting concern in your work.
 
-The 4× weight reflects that cross-project recurrence is the strongest indicator of structural importance. "AEM Replication" showing up in three different workspace paths means you've thought about it in three different problem contexts. That's a concept that deserves its own note. "AEM Replication" showing up 50 times in one project might just be background noise from a focused week of work.
+The 4× weight reflects that cross-project recurrence is the strongest environmental indicator of structural importance. "AEM Replication" showing up in three different workspace paths means you've thought about it in three different problem contexts — three different projects, three different codebases, potentially three different teams. That concept has earned its own note. "AEM Replication" showing up 50 times in one project might just be background noise from a focused sprint.
+
+Note that `projectSources` is a `Set` — adding the same source or path twice doesn't increase the count. The weight is applied to the count of *distinct* workspaces, not total appearances.
 
 ### The default threshold: 8
 
-The default minimum signal score (`--min-signal 8`) was chosen to filter out:
+The default minimum signal score (`--min-signal 8`, controlled via `DEFAULT_MIN_SIGNAL = 8` in `defrag.js`) was calibrated to filter:
 
-- **Single-session, no-decision concepts** (score: 2) — too weak
-- **Common tech terms with no decisions or code** — e.g. a concept appearing in 2 sessions but never in a decision or code snippet scores 4
+- **Single-session, no-decision concepts**: score = `(1×2) = 2` — far too weak
+- **Common tech terms, multiple sessions, no decisions or code**: e.g. 2 sessions = `(2×2) = 4` — still weak
 
-To cross the threshold with `score ≥ 8`, a concept needs at least one of these combinations:
-- 2 sessions + 1 decision sentence: `(2×2) + (1×5) = 9` ✓
-- 1 session + 1 code snippet + 1 cross-project mention: `(1×2) + (1×3) + (1×4) = 9` ✓
-- 4 sessions (cross-project): `(2×2) + (2×4) = 12` ✓ (appears in 2 different workspaces)
-- 1 session + 2 decisions: `(1×2) + (2×5) = 12` ✓ (heavily reasoned about)
+To cross the threshold with `score ≥ 8`, a concept needs at minimum one of these combinations:
 
-The threshold is tunable via `--min-signal <n>`. Lower it to include more borderline concepts; raise it to keep only the most certain signal.
+| Combination | Score | Notes |
+|-------------|-------|-------|
+| 2 sessions + 1 decision | `(2×2)+(1×5) = 9` | Most common qualifying case |
+| 1 session + 1 code + 1 cross-project | `(1×2)+(1×3)+(1×4) = 9` | Technical concept in use |
+| 4 sessions, 2 workspaces | `(4×2)+(2×4) = 16` | Cross-project recurrence |
+| 1 session + 2 decisions | `(1×2)+(2×5) = 12` | Heavily reasoned about |
+| 1 session + 1 decision + 1 code | `(1×2)+(1×5)+(1×3) = 10` | Decided and implemented |
+
+The threshold is tunable via `--min-signal <n>`. Useful calibration approaches:
+- Run `--dry-run --verbose` to see concept frequency without writing files
+- Lower the threshold to include borderline concepts for discovery
+- Raise it (e.g. `--min-signal 15`) for very large corpora where even "interesting" concepts are numerous
 
 ### What happens to low-signal concepts
 
 Concepts that don't meet the threshold are not discarded. They are written to `_low-signal.md` as a searchable alphabetical index with mention counts. This serves two purposes:
 
-1. **Completeness**: the raw concept still exists somewhere in the vault if you want to find it via QMD or Obsidian search.
-2. **Graph cleanliness**: `_low-signal.md` is one file, not one file per term. A vault with 8,000 individual concept nodes is unusable as a knowledge graph. The tier system ensures the graph contains ~50–500 high-signal nodes that represent your actual knowledge topology.
+1. **Completeness**: every extracted concept still exists somewhere in the vault, searchable by QMD and by Obsidian's built-in search.
+2. **Graph cleanliness**: `_low-signal.md` is one file, not one file per term. A vault with 8,000 individual concept nodes is unusable as a knowledge graph — it's visual noise with no structure. The tier system ensures the graph contains a manageable number of high-signal nodes (typically 50–500) representing your actual knowledge topology.
 
-If you later realize a low-signal concept is actually important, re-run with `--min-signal 4` to promote it to a full note.
+Re-running with `--min-signal 4` will promote low-signal concepts to full notes for concepts that scored 4–7. The `--min-signal 0` flag produces a note for every extracted concept — useful for bulk exploration of an unfamiliar corpus.
 
 ---
 
-## Excerpt Ranking
+## 4. Excerpt Ranking
 
-Excerpt ranking is the mechanism by which concept notes acquire meaningful, quoted context from the sessions that mention them, rather than just session titles.
+Excerpt ranking is how concept notes acquire meaningful, quoted context from the sessions that mention them, rather than just session titles and bare links.
 
 ### The problem
 
-A concept note for "OSGi Bundle Lifecycle" that just says "mentioned in 4 sessions" is marginally useful. A concept note that quotes the three sentences where you explicitly worked through why bundle activation order matters is actually valuable — it reconstructs your reasoning without requiring you to re-read the sessions.
+A concept note for "OSGi Bundle Lifecycle" that just says "mentioned in 4 sessions" is marginally useful. A concept note that quotes the three sentences where you explicitly worked through why bundle activation order matters is actually valuable — it reconstructs your reasoning without requiring you to re-read the full sessions.
 
 ### The algorithm
 
-Implemented in `extractor.js → extractConceptExcerpts()`.
-
-For each concept, iterate over every session that contains it. For each session, iterate over each message. Within each message, split into paragraphs, then into sentences. For each sentence that contains the concept (via word-boundary regex), extract a context window:
+Implemented in `extractor.js → extractConceptExcerpts(concept, sessionItems, maxExcerpts = 5)`.
 
 ```
-window = [sentence[i-1], sentence[i], sentence[i+1]].join(' ').slice(0, 300)
+For each session that contains the concept:
+  For each message in the session:
+    Split into paragraphs (on \n{2,})
+    Skip paragraphs that don't contain the concept (fast pre-filter)
+    Split paragraph into sentences (on lookbehind [.!?]\s+)
+    Filter sentences shorter than 15 chars
+    For each sentence containing the concept:
+      Build a 3-sentence window:
+        window = [sentences[i-1], sentences[i], sentences[i+1]]
+                 .filter(Boolean).join(' ').slice(0, 300)
+      Deduplicate by normalized text (lowercase + whitespace-collapse)
+      Score the window against EXCERPT_SIGNAL_PATTERNS
+      Push to candidates
+Sort candidates by score descending
+Return top maxExcerpts (default: 5)
 ```
 
-This one-before, current, one-after window provides context without padding. Sentences that are too short (`< 15 chars`) are filtered before windowing; the assembled window is capped at 300 characters to stay token-efficient for downstream QMD indexing.
+### Sentence window scoring
 
-Each candidate window is then scored:
+Each candidate window starts with a base score of 1. Each `EXCERPT_SIGNAL_PATTERN` that matches adds 2 points:
 
 ```js
-let score = 1; // base score
-for (const pat of EXCERPT_SIGNAL_PATTERNS) {
-  if (pat.test(window)) score += 2;
-}
+const EXCERPT_SIGNAL_PATTERNS = [
+  // Decision language (score +2)
+  /\b(decided|will use|going with|avoid|chosen|don't use|do not use|opted for|settled on)\b/i,
+  // Problem framing (score +2)
+  /\b(issue|problem|failing|broken|slow|error|bug|crash|failing)\b/i,
+  // Code context (score +2)
+  /\b(function|method|class|returns|throws|implements|extends|interface)\b/i,
+];
 ```
 
-**Priority 3 (score += 2) — Decision language**:
-```
-/\b(decided|will use|going with|avoid|chosen|don't use|do not use|opted for|settled on)\b/i
-```
-These phrases mark explicit reasoning. An excerpt containing "we decided to avoid `BundleActivator` because..." is worth 3× more than a neutral descriptive sentence.
+A window matching all three patterns scores 7 (1 base + 2 + 2 + 2). A window matching none scores 1. The ordering is by score descending, so concept notes surface the most decision-rich, problem-framed, or code-contextual excerpts at the top.
 
-**Priority 2 (score += 2) — Problem framing**:
-```
-/\b(issue|problem|failing|broken|slow|error|bug|crash|failing)\b/i
-```
-Problem framing shows the context that motivated a decision. "The bundle keeps failing to activate" — this sentence tells you *why* a decision was needed, which makes adjacent decision sentences interpretable.
+**Why these three pattern categories:**
 
-**Priority 1 (score += 2) — Code context**:
-```
-/\b(function|method|class|returns|throws|implements|extends|interface)\b/i
-```
-Sentences that connect the concept to implementation are more concrete than pure prose explanation.
-
-Excerpts are **deduplicated by normalized text** (lowercase, whitespace-normalized). If two windows from different sessions are textually near-identical, only one is kept. After sorting by score descending, the top 5 are selected.
+- **Decision language** is the highest-value excerpt type. "We decided to avoid `BundleActivator` because..." is the compressed form of a reasoning chain. If you can see one of these sentences you can reconstruct the full thought.
+- **Problem framing** shows the context that motivated a decision. "The bundle keeps failing to activate" tells you *why* a decision was needed, making adjacent decision sentences interpretable. Without problem context, decisions can seem arbitrary.
+- **Code context** bridges from discussion to implementation. "The `activate()` method is called by the OSGi container" — this sentence provides the concrete technical anchor for an abstract concept.
 
 ### Why sentence windows rather than full paragraphs
 
-Full paragraphs would include too much context — they become mini-essays that defeat the goal of having a scannable concept note. Individual sentences without context are too cryptic ("just avoid the manual approach" — avoid what?). The three-sentence window is the minimum meaningful unit: it captures why the concept came up, the sentence containing it, and what immediately followed.
+Full paragraphs would include too much context — they become mini-essays that defeat the goal of having a scannable concept note. Individual sentences without context are often too cryptic ("just avoid the manual approach" — avoid *what*?). The three-sentence window is the minimum meaningful unit: it captures why the concept came up (preceding sentence), the sentence containing it, and what immediately followed (consequent sentence).
 
-The 300-character cap ensures that windows remain atomic knowledge units composable for downstream semantic indexing. QMD's embeddings work best on focused, self-contained passages.
+The 300-character cap ensures windows remain atomic knowledge units composable for downstream semantic indexing. QMD's embeddings work best on focused, self-contained passages.
+
+### Deduplication
+
+Before scoring, windows are deduplicated by normalized text:
+
+```js
+const key = window.toLowerCase().replace(/\s+/g, ' ');
+if (seenKeys.has(key)) continue;
+seenKeys.add(key);
+```
+
+This catches cases where the same passage appears in multiple sessions (e.g. copy-pasted context, common boilerplate). Exact-match deduplication is used rather than fuzzy similarity because fuzzy matching at scale would be expensive and the precision gain is minimal — truly identical text is the problem to solve.
 
 ---
 
-## Session Narrative Construction
+## 5. Session Narrative Construction
 
-Every session note includes a 2–3 sentence narrative at the top that answers: **what was this session about, and what came out of it?** When you're scanning 196 sessions in the `_timeline.md` view, this narrative is the difference between finding the right session in 10 seconds vs. 10 minutes.
+Every session note includes a 2–3 sentence narrative at the top answering: **what was this session about, and what came out of it?** When scanning 196 sessions in `_timeline.md`, this narrative is the difference between finding the right session in 10 seconds versus 10 minutes.
 
-Implemented in `extractor.js → extractSessionNarrative()`.
+Implemented in `extractor.js → extractSessionNarrative(session, extracted)`.
 
 ### Step 1 — Opening (the problem statement)
 
 ```js
-const firstHuman = humanMessages[0].content || '';
-const firstLine  = firstHuman
+const firstLine = firstHuman.content
   .replace(/\n+/g, ' ')
   .trim()
-  .split(/[.!?]\s+/)[0]
+  .split(/[.!?]\s+/)[0]   // first sentence only
   .slice(0, 150)
   .trim();
 ```
 
-The first human message is almost always a problem statement, question, or task. People open LLM sessions with intent. Taking the first sentence (split at `.`, `!`, or `?` followed by whitespace) and truncating to 150 characters captures this intent without including the full context dump that often follows.
+The first human message in an LLM session is almost always a problem statement, question, or task. People open LLM sessions with intent — the opening question defines what the session is for. Taking the first sentence (split at `.`, `!`, or `?` followed by whitespace) and truncating to 150 characters captures this intent without including the full context dump that often follows.
 
-Edge cases:
-- If the first human message is empty or very short, fall back to `Topic: {session.title}`.
-- The 150-character limit is a sentence-boundary truncation, not a hard cut — `split(/[.!?]\s+/)[0]` ensures we don't truncate mid-sentence.
+**Design note**: `split(/[.!?]\s+/)[0]` is used rather than a hard 150-character slice. The sentence split happens first, ensuring the opening ends at a sentence boundary. The 150-character slice is only a fallback cap for the rare case of an extremely long first sentence (e.g. a dense technical question without punctuation). The result is a clean, grammatically complete problem statement.
+
+**Fallback**: if the first human message is empty or under 10 characters, fall back to `Topic: {session.title}`. This keeps the narrative useful even for sessions that started with a tool invocation or file dump rather than a natural-language question.
 
 ### Step 2 — Approach (what was tried)
 
 ```js
 const best = decisions
   .slice()
-  .sort((a, b) => b.length - a.length)
-  .find((d) => d.length <= 200);
+  .sort((a, b) => b.length - a.length)         // longest first
+  .find((d) => d.length <= 200);               // but not too long
 ```
 
-Decision sentences extracted from the session are sorted by length descending. The longest decision sentence that fits within 200 characters is selected — length correlates with specificity (short decision sentences tend to be vague; long ones contain the actual reasoning).
+Decision sentences from the session are sorted by length descending. The longest sentence that fits within 200 characters is selected. This heuristic rests on a practical observation: short decision sentences tend to be vague ("we should use the other approach"), while longer ones contain the actual reasoning ("we decided to use `BundleContext.registerService()` directly instead of Declarative Services because we need dynamic service registration at runtime"). Length correlates with specificity.
 
-If no decision sentences were extracted, fall back to:
+**Fallback**: if no decision sentences were extracted, fall back to:
 ```
-Covered: {top 4 concepts}.
+Covered: {top 4 concepts from extracted.concepts}.
 ```
 
-This fallback is weaker but honest — it tells you what topics were in play without fabricating a conclusion.
+This weaker form is still useful — it tells you what topics were in play without fabricating a conclusion. "Covered: OSGi, BundleActivator, ServiceLoader, Sling." is honest about what the session contained without pretending to know what was concluded.
 
 ### Step 3 — Outcome (what was concluded)
 
-Scan assistant messages in reverse order (most recent first) for conclusion language:
+Scan assistant messages in reverse chronological order (most recent first) for conclusion language:
+
 ```js
 const CONCLUSION_PATTERNS = [
   /\b(recommend|suggest|should|best approach|in summary|ultimately|conclusion|final)\b/i,
@@ -371,7 +434,9 @@ const CONCLUSION_PATTERNS = [
 ];
 ```
 
-The first matching sentence found (scanning backwards through assistant messages) becomes the outcome, truncated to 200 characters. If no conclusion language is found, the outcome is omitted — a 2-sentence narrative is better than a 3-sentence narrative with a fabricated conclusion.
+The first matching sentence found becomes the outcome, truncated to 200 characters. Scanning in reverse order maximizes the chance of finding the assistant's final summary or recommendation — the sentence most likely to contain the session's conclusion.
+
+**Why omit rather than fabricate**: if no conclusion language is found, the outcome is omitted entirely. A 2-sentence narrative is better than a 3-sentence narrative with a fabricated conclusion. Adding a placeholder like "Session ended without conclusion" would be noise; omitting the outcome part signals to the reader that the session may have been exploratory or cut off.
 
 ### Assembly
 
@@ -380,11 +445,11 @@ const parts = [opening, approach, outcome].filter(Boolean);
 return parts.join(' ');
 ```
 
-The result is 1–3 sentences: the minimum necessary to reconstruct the session's shape. It won't win literary prizes. The goal is functional recall, not quality prose.
+The result is 1–3 sentences. The function will always return *something* because the opening step has its own fallback to the session title. The narrative is functional recall, not quality prose — it answers "what was this?" not "tell me about this."
 
 ---
 
-## Tiered Note Creation
+## 6. Tiered Note Creation
 
 The vault uses a three-tier system to prevent graph pollution while preserving full-text coverage.
 
@@ -394,39 +459,78 @@ Concepts with `signalScore ≥ threshold` (default 8) receive a standalone note 
 
 **File**: `concepts/{slug}.md`
 
-**Content**:
-- YAML frontmatter with `title`, `tags`, `source`, `date`
-- `## Context` — a 2–3 sentence excerpt from the first session mentioning the concept (built by `buildContextSummary()` in `obsidian.js`)
-- `## Related` — concepts that co-occur in the same sessions, sorted by co-occurrence frequency
-- `## Mentions` — wikilinks to every session note that mentioned this concept
-- `<!-- defrag:end -->` marker (future: content below preserved across re-runs)
+The slug is computed by `slugify(concept)`:
+```js
+str.toLowerCase()
+   .replace(/[^a-z0-9]+/g, '-')
+   .replace(/^-+|-+$/g, '')
+   .slice(0, 80)
+```
 
-**Graph behavior**: Tier 1 notes appear as nodes in the Obsidian graph. They connect to session notes (via `## Mentions` wikilinks) and to each other (via `## Related` wikilinks). This creates the knowledge topology that makes the graph useful.
+**Content structure** (as rendered by `renderConceptNote()`):
 
-**QMD behavior**: Tier 1 notes are primary documents in QMD's `concepts` collection, indexed with full semantic embeddings.
+```markdown
+---
+title: "OSGi Bundle Lifecycle"
+tags: [concept, claude, cursor]
+signal: 24
+sessions: 6
+decisions: 3
+first-seen: 2025-02-14
+last-seen: 2025-05-21
+---
+
+# OSGi Bundle Lifecycle
+
+## Key Decisions
+- We decided to use DS annotations rather than BundleActivator for lifecycle management (2025-03-01, [[sessions/claude-2025-03-01-osgi-ds-migration]])
+- Avoid manual bundle activation order — use service dependencies instead (2025-04-12, [[sessions/cursor-2025-04-12-bundle-ordering]])
+
+## Context & Excerpts
+> "The activator approach fails because OSGi doesn't guarantee activation order between bundles..."
+> — [[sessions/claude-2025-02-14-osgi-lifecycle|OSGi lifecycle deep-dive]], 2025-02-14
+
+## Code Context
+Links to code snippets where this concept appears:
+- [[code/snippet-042]] — java — BundleActivator
+
+## Sessions (6)
+- [[sessions/cursor-2025-05-21-osgi-replication|OSGi replication issue]] — 2025-05-21
+- [[sessions/claude-2025-04-12-bundle-ordering|Bundle ordering]] — 2025-04-12
+...
+
+## Related
+- [[concepts/osgi|OSGi]]
+- [[concepts/sling|Sling]]
+- [[concepts/aem|AEM]]
+
+<!-- defrag:end -->
+```
+
+The YAML frontmatter carries `signal`, `sessions`, and `decisions` counts. These are indexed by QMD as filterable facets and are visible in Obsidian's file metadata pane without opening the note.
+
+**Graph behavior**: Tier 1 notes appear as nodes in the Obsidian graph. They connect to session notes (via `## Sessions` wikilinks) and to each other (via `## Related` wikilinks). This creates the knowledge topology that makes the graph useful: concept clusters emerge organically from co-occurrence patterns.
 
 ### Tier 2 — Low-signal concepts
 
-Concepts with `signalScore < threshold` are collected into `_low-signal.md`, grouped alphabetically with their mention count.
+Concepts with `signalScore < threshold` are collected into `_low-signal.md`, grouped alphabetically with their session mention count:
 
 ```markdown
 ## A
-
-- **async** (4 mentions)
-- **array** (2 mentions)
+- async (4 mentions)
+- array (2 mentions)
 
 ## B
-
-- **base** (3 mentions)
+- base (3 mentions)
 ```
 
-**Why not individual files?** The Obsidian graph is a visual knowledge map. If every term with 2 mentions becomes a node, the graph becomes a sea of dots with no navigable structure. `_low-signal.md` is a single file — it appears as one node, and that node is clearly labeled as the "noise bin."
+**Why not individual files?** The Obsidian graph is a visual knowledge map. If every term with 2 mentions becomes a node, the graph becomes a sea of dots with no navigable structure. `_low-signal.md` is one file — it appears as one node in the graph, clearly labeled as the index of borderline terms.
 
-**Promotability**: `_low-signal.md` is fully searchable by QMD and by Obsidian's built-in search. If you remember discussing something and want to find it, the low-signal index will surface it. You can then re-run with `--min-signal 4` to promote it to a Tier 1 note if it turns out to be worth it.
+**Promotability**: `_low-signal.md` is fully searchable by QMD and by Obsidian's built-in search. If you remember discussing something and want to find it, the low-signal index will surface it. Re-run with `--min-signal 4` to promote those terms to Tier 1 notes.
 
 ### Tier 3 — Stopwords (filtered at extraction time)
 
-The `CONCEPT_STOPWORDS` set in `extractor.js` contains terms that carry zero knowledge signal and are filtered before concept candidates are even scored:
+The `CONCEPT_STOPWORDS` set in `extractor.js` contains terms filtered *before* concept candidates are even scored. They are never written anywhere in the vault:
 
 ```js
 const CONCEPT_STOPWORDS = new Set([
@@ -440,39 +544,44 @@ const CONCEPT_STOPWORDS = new Set([
 ]);
 ```
 
-These are programming keywords, common English nouns in developer contexts, and structural terms that appear constantly but mean nothing on their own. Filtering them at extraction time means they never consume scoring CPU, never appear in concept maps, and never reach `_low-signal.md`.
+These are programming keywords, common English nouns in developer contexts, and structural terms that appear constantly but carry zero knowledge signal on their own. Filtering at extraction time means they never consume signal-scoring CPU, never appear in concept maps, and never reach `_low-signal.md`.
 
-The distinction between Tier 2 and Tier 3 is intent: Tier 2 terms might become interesting with more context or with a lower threshold. Tier 3 terms are definitionally uninteresting — no amount of sessions or decisions would make "null" a useful concept note.
+**The distinction between Tier 2 and Tier 3**: Tier 2 terms *might* become interesting with more context or a lower threshold. Tier 3 terms are definitionally uninteresting — no amount of sessions or decisions would make "null" a useful concept note. The stopword list represents this categorical judgment; the signal threshold represents a quantitative one.
 
 ### The graph philosophy
 
-The Obsidian graph is meaningful only if its nodes represent things worth knowing about. A graph with 400 nodes, each a real concept you've worked with, is a knowledge map. A graph with 8,000 nodes — half of which are "string", "async", "data" — is noise. The tier system enforces the discipline that makes the graph useful: **the graph shows your actual knowledge topology, not a frequency distribution of your vocabulary**.
+The Obsidian graph is meaningful only if its nodes represent things worth knowing about. A graph with 400 nodes, each a real concept you've worked with, is a knowledge map — you can see clusters, bridges, and isolated ideas. A graph with 8,000 nodes — half of which are "string", "async", "data" — is noise. The tier system enforces the discipline that makes the graph useful: **the graph shows your actual knowledge topology, not a frequency distribution of your vocabulary**.
 
 ---
 
-## The Linker
+## 7. The Linker
 
 The linker (`cli/writers/linker.js`) runs as a post-processing pass over the written vault. Its job is to inject `[[wikilinks]]` into plain-text mentions of known note titles, so that concepts referenced in session notes automatically become navigable links in Obsidian.
 
 ### Why a separate pass?
 
-The writer generates notes in sequence: session notes first, then concept notes. If wikilink injection happened during write time, session notes would need to know which concept notes exist before those notes are written. The linker solves this by running after all notes are written — it operates on a complete vault with full knowledge of all note titles.
+The writer generates notes in sequence: session notes first, then concept notes. If wikilink injection happened during write time, session notes would need to know which concept notes exist before those notes are written. The linker solves this by running after all notes are written — it operates on a complete vault with full knowledge of all note titles. This also means the linker is reusable for vaults not generated by this tool.
 
 ### Pass 1 — Registry construction
 
 ```
 buildRegistry(vaultDir)
-  → collectMarkdownFiles(vaultDir)
+  → collectMarkdownFiles(vaultDir)      ← recursive walkDir, all *.md
   → for each file:
-      extractTitle(content, filePath)    ← front-matter title, or H1, or filename
-      extractAliases(content, title)     ← front-matter aliases[] + lowercase title
+      extractTitle(content, filePath)   ← front-matter title > H1 > filename
+      extractAliases(content, title)    ← front-matter aliases[] + lowercase(title)
   → returns Entry[]
      { filePath, vaultPath, title, aliases }
 ```
 
-Every Markdown file in the vault gets an entry. `vaultPath` is the path relative to the vault root without `.md` — e.g. `concepts/jackrabbit-oak`. This is the target string for wikilinks: `[[concepts/jackrabbit-oak|Jackrabbit Oak]]`.
+Every Markdown file in the vault gets an entry. `vaultPath` is the path relative to the vault root, without `.md` extension — e.g. `concepts/osgi-bundle-lifecycle`. This is the target string for wikilinks: `[[concepts/osgi-bundle-lifecycle|OSGi Bundle Lifecycle]]`.
 
-**Alias registration**: The linker automatically registers the lowercase form of every title as an alias. So "Jackrabbit Oak" (the stored title) will match `jackrabbit oak` in plain text. The `aliases` front-matter field can be used to register additional variants.
+**Alias registration**: The linker automatically registers the lowercase form of every title as an alias. So "OSGi Bundle Lifecycle" (stored title) will match `osgi bundle lifecycle` in plain text. The `aliases:` front-matter field can register additional variants (e.g. abbreviated forms, alternative spellings).
+
+**Title extraction priority**:
+1. `title:` field in YAML frontmatter
+2. First `# H1` heading
+3. Filename with hyphens replaced by spaces (last resort)
 
 ### Pass 2 — Zone tokenization and injection
 
@@ -484,62 +593,68 @@ tokenise(content) → Zone[]
 Zone types:
   frontmatter   --- ... ---  at the start of the file
   codeblock     ```...```    fenced code
-  codespan      `...`        inline code
+  codespan      `...`        inline code  
   wikilink      [[...]]      existing wikilink
   mdlink        [text](url)  markdown hyperlink
   text                       everything else
 ```
 
-Only `text` zones are candidates for link injection. Frontmatter, code blocks, code spans, and existing wikilinks are passed through unchanged. This prevents:
-- Linking `yaml` keys in frontmatter
-- Injecting wikilinks into code blocks (which would corrupt the code)
-- Double-linking already-linked terms
+Only `text` zones are candidates for link injection. All other zones are passed through unchanged. This prevents:
+- Linking YAML keys in frontmatter (`source: claude` should not become `source: [[concepts/claude|claude]]`)
+- Injecting wikilinks into code blocks (which would corrupt the code syntax)
+- Double-linking already-wikilinked terms
+- Corrupting existing Markdown hyperlinks
 
-The zone tokenizer uses a single regex pass to identify protected regions, interleaved with plain text:
+The zone tokenizer uses a single regex pass over the body content:
 
 ```js
 const PROTECTED_RE = /(```[\s\S]*?```|`[^`\n]+`|\[\[[^\]]+\]\]|\[[^\]]+\]\([^)]+\))/g;
 ```
 
+Plain text between protected regions becomes `text` zones. The frontmatter is handled separately first (it must appear at the start of the file).
+
 ### The forward-scan position check
 
-Within `text` zones, the linker uses `String.replace()` with a regex to find term occurrences. Before committing to a replacement, it checks whether the match position is inside a protected region that the zone tokenizer might have missed (edge cases involving partial matches at zone boundaries):
+Within `text` zones, the linker uses a global regex replace to find term occurrences. Before committing to a replacement, it checks whether the match position is inside a protected region that might have been missed at zone boundaries:
 
 ```js
-const before       = text.slice(0, offset);
+const before = text.slice(0, offset);
+
+// Count unclosed [[ without matching ]]
 const openBrackets  = (before.match(/\[\[/g)  || []).length;
 const closeBrackets = (before.match(/\]\]/g)  || []).length;
 if (openBrackets > closeBrackets) return match; // inside a wikilink
 
+// Count unmatched backticks
 const backticks = (before.match(/`/g) || []).length;
 if (backticks % 2 !== 0) return match; // inside a code span
 ```
 
-This forward-scan approach counts unclosed `[[` and unmatched backticks in the text preceding the match. If the counts indicate an unclosed protected region, the match is left as-is.
+This forward-scan approach counts unclosed `[[` and unmatched backticks in the text preceding the match. If the counts indicate an unclosed protected region, the match is returned unchanged.
 
-**Why not lookbehind regex?** Lookbehind for nested or multiline patterns is unreliable across Node.js versions prior to v22, and the patterns involved (arbitrary content between `[[` and `]]`) cannot be expressed as fixed-length lookbehind. The forward scan is O(n) per match but straightforward and portable.
+**Why not lookbehind regex?** Lookbehind for nested or multiline patterns is unreliable across Node.js versions prior to v22, and the patterns involved (arbitrary content between `[[` and `]]`) cannot be expressed as fixed-length lookbehind assertions. The forward scan is O(n) per match but straightforward and portable across all Node versions the tool supports.
 
-### First-occurrence-only linking
-
-The `linkifyTerm()` function replaces **all occurrences** via `String.replace(re, ...)` with a global regex. However, after the first replacement the match text becomes `[[vaultPath|term]]`, which is a `wikilink` zone in subsequent passes and will not be re-matched. The net effect is that each term is linked at most once per text zone, and since the zone tokenizer splits at existing wikilinks, the first occurrence in contiguous text gets the link and subsequent occurrences in the same zone do not. This is the correct behavior: a note about AEM Replication does not need "AEM" linked 47 times. One link establishes the connection; the rest are visual clutter.
-
-### Self-link prevention
+### Linking behavior and self-link prevention
 
 ```js
+// Don't self-link: the OSGi note should not wikilink its own title
 if (entry.vaultPath === currentVaultPath) continue;
+
+// Only link terms that are at least 3 characters
+if (!candidate || candidate.length < 3) continue;
 ```
 
-A note is never linked to itself. The "AEM Replication" concept note will not have `[[concepts/aem-replication|AEM Replication]]` injected into its own body.
+A note is never linked to itself. The `linkifyTerm()` function replaces all occurrences via a global regex, but after the first replacement the match text becomes `[[vaultPath|term]]` — a `wikilink` zone — and will not be re-matched by subsequent calls. The practical effect is first-occurrence-only linking per text zone: one link establishes the navigable connection; subsequent occurrences in the same contiguous text block remain unlinked. This prevents visual clutter from over-linking.
 
 ---
 
-## Source Formats
+## 8. Source Formats
 
 Each miner is responsible for a single source's format. All miners implement the same interface:
 
 ```js
 async function mine({ since, verbose } = {}) {
-  // returns: { source: string, sessions: Session[], skipped?: [] }
+  // Returns: { source: string, sessions: Session[], skipped?: any[] }
 }
 ```
 
@@ -554,69 +669,86 @@ The returned `Session` objects share this normalized shape:
   timestamp: Date,         // session start time
   messages:  Message[],    // [{ role, content, timestamp? }]
   turnCount: number,
-  // miner-specific:
-  format?:    string,      // 'desktop' | 'code' (claude)
-  workspace?: string,      // workspace hash (cursor)
+  // miner-specific optional fields:
+  format?:    string,      // 'desktop' | 'code' (Claude miner)
+  workspace?: string,      // workspace hash (Cursor miner)
 }
 ```
+
+Role values are normalized to `'human'` or `'assistant'` by each miner. Unknown roles (e.g. `'tool'`, `'system'`) are preserved as-is — the extraction engine ignores them, but they remain available in the session object for debugging.
+
+---
 
 ### Claude Miner
 
 **File**: `cli/miners/claude.js`
 
-**Search roots** (checked in order):
+**Search roots** (all three are checked on every run):
 ```
 ~/.claude/
-~/.config/claude/
-~/Library/Application Support/Claude/    (macOS Claude Desktop)
+~/.config/claude/                        (XDG config fallback)
+~/Library/Application Support/Claude/    (macOS Claude Desktop app)
 ```
 
-All three roots are searched; the same file discovered in multiple roots (via symlinks) is deduplicated using `fs.realpathSync()` before processing.
+All three roots are searched and deduplicated using `fs.realpathSync()` before processing — the same file discovered via a symlink from multiple roots is only processed once.
 
-**File discovery**: `walkDir()` recursively enumerates all `.jsonl` files under each root. No glob library is used — `fs.readdirSync()` with `withFileTypes: true` is called recursively. Permission errors and broken symlinks are silently skipped, since user home directories commonly contain inaccessible paths.
+**File discovery**: `walkDir()` recursively enumerates all `.jsonl` files under each root using `fs.readdirSync({ withFileTypes: true })`. No glob library is used. Permission errors and broken symlinks are silently skipped via try/catch, since user home directories frequently contain inaccessible paths.
 
 **Format detection**: The miner reads the first non-empty line of each file and calls `detectFormat()`:
 
 ```
-Desktop format:  { "uuid": "...", "messages": [...] }
-  → each line is a complete conversation
-  → one file may contain multiple sessions
+Desktop format:
+  First line: { "uuid": "...", "messages": [...] }
+  → each line is a COMPLETE conversation
+  → one file may contain multiple sessions (one per line)
+  → format = 'desktop'
 
-Code format:     { "type": "user", "message": { ... }, "timestamp": "..." }
-  OR:            { "role": "human", "content": "...", "timestamp": "..." }
-  → each line is a single turn
+Code format (shape 1):
+  First line: { "type": "user", "message": { "role": "...", "content": "..." }, "timestamp": "..." }
+  → each line is a SINGLE TURN
   → one file = one session
+  → format = 'code'
+
+Code format (shape 2, older variant):
+  First line: { "role": "human", "content": "...", "timestamp": "..." }
+  → each line is a SINGLE TURN
+  → format = 'code'
 ```
 
-**Desktop format parsing** (`parseDesktopFile`): Each line is parsed as a complete conversation object with a `messages` array. Content arrays (Claude's API returns content as `[{type: "text", text: "..."}]` blocks) are flattened to plain text by `flattenContent()`. Tool-use and tool-result blocks are included if they contain text; otherwise skipped.
+Both 'code' and 'unknown' formats are processed by the Code parser. Unknown format is likely a variant of Claude Code; the parser degrades gracefully — it silently skips lines that don't normalize to a valid message.
 
-**Code format parsing** (`parseCodeFile`): Each line is parsed as a single turn. The three known message shapes are normalized:
+**Desktop format parsing** (`parseDesktopFile`): Each line is parsed as a complete conversation object with a `messages` array. Content arrays (Claude's API returns content as `[{type: "text", text: "..."}, ...]` blocks) are flattened to plain text by `flattenContent()`. Tool-use and tool-result blocks are included if they contain text; otherwise skipped.
+
+**Code format parsing** (`parseCodeFile`): Each line is parsed as a single turn. Three known message shapes are normalized:
 
 | Shape | Detection | Fields used |
 |-------|-----------|-------------|
-| Shape A — direct | `obj.role && obj.content` | `role`, `content`, `timestamp` |
-| Shape B — wrapped | `obj.message && obj.message.role` | `obj.type` or `obj.message.role`, `obj.message.content`, `obj.timestamp` |
-| Shape C — legacy | `obj.type in ['human','assistant'] && obj.text` | `obj.type`, `obj.text`, `obj.createdAt` |
+| Shape A — direct turn | `obj.role && obj.content !== undefined` | `role`, `content`, `timestamp` |
+| Shape B — wrapped turn (Claude Code) | `obj.message && typeof obj.message === 'object'` | `obj.type` or `obj.message.role`, `obj.message.content`, `obj.timestamp` |
+| Shape C — legacy type field | `obj.type in ['human','assistant'] && obj.text` | `obj.type`, `obj.text`, `obj.createdAt` |
 
 **URL-encoded project paths**: Claude Code stores project-scoped sessions in directories named after URL-encoded absolute paths, e.g.:
 ```
 ~/.claude/projects/%2FUsers%2Falice%2Fprojects%2Fmy-app/abc123.jsonl
 ```
 
-The parent directory name is passed through `safeDecodeURIComponent()` and `path.basename()` to extract a human-readable project name for the session title fallback.
+The parent directory name is decoded via `safeDecodeURIComponent()` (which handles the `+` → space convention and catches malformed encodings without throwing) and `path.basename()` to extract a human-readable project name for the session title fallback.
 
-**Title derivation**: Primary source is the first human message, truncated to 60 characters. If the file is a Code-format file with a URL-encoded parent directory, the decoded directory basename is used as a secondary fallback. Final fallback is `Claude Session — {uuid}`.
+**Title derivation priority**:
+1. First human message, whitespace-collapsed, truncated to 60 characters
+2. Decoded URL path basename (Code format, if path was URL-encoded)
+3. `Claude Session — {uuid}` (final fallback)
 
-**Timestamp derivation**: `deriveTimestamp()` iterates all messages looking for the earliest `message.timestamp` or `message.createdAt` value. If none are present, falls back to `fs.statSync(filePath).mtime`.
+**Timestamp derivation**: `deriveTimestamp()` iterates all messages looking for the earliest `message.timestamp` or `message.createdAt` value. If none are present in any message, falls back to `fs.statSync(filePath).mtime`. This means sessions without explicit timestamps are ordered by file modification time — less accurate but non-null.
 
 **Role normalization**:
 ```
-"user", "human"           → "human"
-"assistant", "ai", "bot"  → "assistant"
-other                     → preserved as-is (e.g. "tool", "system")
+"user", "human"             → "human"
+"assistant", "ai", "bot"    → "assistant"
+other (e.g. "tool")         → preserved as-is
 ```
 
-**ID generation**: FNV-1a hash over the file path (Code format) or over `{filePath}:{lineIndex}` (Desktop format, since one file contains multiple conversations). This ensures stability across re-runs as long as the file path doesn't change.
+**ID generation**: FNV-1a hash over the file path (Code format, one session per file) or over `filePath` + `:` + line index (Desktop format, multiple sessions per file). Stability: IDs are stable as long as the file path doesn't change. Desktop format IDs use the line index as a tiebreaker when the conversation object has no `uuid` — if the file is rewritten with lines in a different order, IDs would change. In practice this is rare because Desktop format files are append-only.
 
 ---
 
@@ -643,20 +775,34 @@ other                     → preserved as-is (e.g. "tool", "system")
         └── *.log                 ← plain-text log fallback
 ```
 
-Each `<workspace-hash>` is a hex digest of the workspace's absolute path, generated by VS Code's storage subsystem. The miner does not need to resolve the hash back to a path — the hash is used as a `workspace` identifier in the session object, and the workspace path can be recovered from the `state.vscdb` file itself if needed.
+Each `<workspace-hash>` is a hex digest of the workspace's absolute path, generated by VS Code's storage subsystem. The miner does not need to resolve the hash back to a path — the hash itself is used as the `workspace` field in session objects for cross-project scoring.
 
-**SQLite loading**: The miner tries two SQLite drivers in order:
+**SQLite loading strategy**: The miner tries two SQLite drivers in order:
 
-1. `node:sqlite` (Node.js 22+ built-in, `DatabaseSync`) — no native compilation, no binary dependencies
-2. `better-sqlite3` (npm, requires native compilation) — fallback for Node < 22
+1. `node:sqlite` (Node.js 22+ built-in, `DatabaseSync`) — no native compilation, no binary dependencies, fastest
+2. `better-sqlite3` (npm package, requires native compilation) — fallback for Node < 22
 
-If neither is available, the database is skipped with a verbose warning. This graceful degradation means the tool works on Node 20 environments as long as `better-sqlite3` is installed, and works out-of-the-box on Node 22+ with no additional dependencies.
+```js
+function openDatabase(dbPath) {
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    return new DatabaseSync(dbPath, { allowExtension: false });
+  } catch (_) {}
+  try {
+    const BetterSqlite = require('better-sqlite3');
+    return new BetterSqlite(dbPath, { readonly: true });
+  } catch (_) {}
+  return null;
+}
+```
 
-**Chat key enumeration**: The following `ItemTable` keys are queried in order:
+If neither driver is available, the database is skipped with a verbose warning. This graceful degradation means the tool works on Node 20 environments as long as `better-sqlite3` is installed, and works out-of-the-box on Node 22+ with zero additional dependencies.
+
+**Chat key enumeration**: The following `ItemTable` keys are queried in order for each workspace database:
 
 ```js
 const CHAT_KEYS = [
-  'workbench.panel.aichat.view.aichat.chatdata',  // main chat panel
+  'workbench.panel.aichat.view.aichat.chatdata',  // main chat panel (Cursor 0.40+)
   'aiService.prompts',                             // inline prompts
   'aiService.generations',                         // code generation records
   'composer.composerData',                         // Composer multi-file sessions
@@ -665,38 +811,39 @@ const CHAT_KEYS = [
 ];
 ```
 
-Cursor's storage schema has changed significantly across versions. Rather than version-detecting and dispatching, the miner attempts all known keys and handles "key not present" gracefully. This forward-compatible approach means new Cursor versions that add new keys require only a new entry in `CHAT_KEYS`.
+Cursor's storage schema has changed significantly across versions. Rather than version-detecting and dispatching, the miner attempts all known keys and handles "key not present" gracefully — a `try/catch` around each `db.prepare().get()` call ensures one missing key doesn't abort the others. This forward-compatible approach means new Cursor versions that add new keys require only a new entry in `CHAT_KEYS`.
 
-**Payload shape normalization**: The JSON stored under each key has changed across Cursor versions. Three shapes are handled:
+**Payload shape normalization**: Three shapes are handled:
 
 ```
-Shape A: { tabs: [{ chatTitle, lastSendTime, bubbles: [...] }] }
+Shape A: { tabs: [{ chatTitle, lastSendTime, tabId, bubbles: [...] }] }
   → Cursor 0.40+, main chat panel
   → bubbles use type: "user" | "ai"
-  → content in bubble.text | bubble.rawText | bubble.content
+  → message content in bubble.text | bubble.rawText | bubble.content | bubble.message
+  → session timestamp from tab.lastSendTime
 
 Shape B: [{ prompt, response, timestamp }]
   → older aiService.prompts format
   → flat array of prompt/response pairs
+  → prompt text in item.prompt | item.text | item.question
+  → response text in item.response | item.answer | item.completion
 
 Shape C: { conversations: [{ id, title, messages: [...] }] }
   → aiService.generations and Composer
   → messages use role | type | sender for role field
-  → content in content | text | message
+  → content in m.content | m.text | m.message
 ```
 
-For Shape A bubbles specifically:
+For Shape A bubbles, role normalization handles both old and new Cursor conventions:
 ```js
 const role = bubble.type === 'ai'   ? 'assistant'
            : bubble.type === 'user' ? 'user'
            : bubble.role || null;
 ```
 
-This covers both the old `"human"/"ai"` convention and the newer `"user"/"assistant"` convention without needing to version-detect.
+**Log file fallback**: `mineLogFiles()` scans `~/Library/Application Support/Cursor/logs/` for `.log` files that contain `aiService`, `copilot`, or `chat` in their text. It then attempts to parse each line as JSON, looking for `prompt`/`completion`/`response` fields. This is a last-resort path for sessions that predate or bypass the workspace storage system. Log sessions receive the filename as their title and the file `mtime` as their timestamp.
 
-**Log file fallback**: `mineLogFiles()` scans `~/Library/Application Support/Cursor/logs/` for `.log` files that contain `aiService`, `copilot`, or `chat` in their text. It then attempts to parse each line as JSON, looking for `prompt`/`completion`/`response` fields. This is a last-resort path for sessions that predate or bypass the workspace storage system. Log sessions receive the filename as their title and the file mtime as their timestamp.
-
-**Deduplication**: After mining both workspace storage and logs, sessions are deduplicated by `session.id` within the Cursor miner before returning. This handles cases where the same chat appears in both storage systems.
+**Internal deduplication**: After mining both workspace storage and logs, sessions are deduplicated by `session.id` within the Cursor miner before returning. This handles cases where the same chat appears in both storage systems.
 
 ---
 
@@ -706,7 +853,7 @@ This covers both the old `"human"/"ai"` convention and the newer `"user"/"assist
 
 **Search root**: `~/.codex/`
 
-Codex CLI has undergone multiple storage format changes across versions. The miner uses a degradation-tolerant multi-strategy approach:
+Codex CLI has undergone multiple storage format changes. The miner uses a degradation-tolerant multi-strategy approach, checking for each format's existence in order:
 
 **Strategy 1 — Sessions directory** (`~/.codex/sessions/<id>.json`):
 Each file is a JSON session object:
@@ -723,7 +870,7 @@ Each file is a JSON session object:
 ```
 
 **Strategy 2 — History file** (`~/.codex/history.json` or `~/.codex/history`):
-A single JSON array of all sessions. Same session shape as above.
+A single JSON array of all sessions. Same session shape as Strategy 1.
 
 **Strategy 3 — SQLite database** (`~/.codex/history.db`):
 ```sql
@@ -734,75 +881,85 @@ CREATE TABLE sessions (
   messages TEXT      -- JSON array
 );
 ```
+Loaded with the same two-driver strategy as the Cursor miner.
 
 **Strategy 4 — JSONL file** (`~/.codex/conversations.jsonl`):
 One session per line, same shape as Strategy 1.
 
-The miner checks for each format's existence in order and uses the first that exists. The `cwd` field, when present, is normalized to a project slug by taking `path.basename(cwd)`. This provides the workspace path context used in `crossProjectCount` scoring.
+The `cwd` field, when present, is normalized to a project slug via `path.basename(cwd)`. This value is used as `session.workspacePath`, which feeds into `crossProjectCount` in signal scoring.
 
 ---
 
-## Idempotency
+## 9. Idempotency
 
-Context Defrag is designed to be run repeatedly on a live vault — after every work session, on a cron schedule, or via `--watch`. Re-runs must update content without duplicating or destroying it.
+Context Defrag is designed to be run repeatedly on a live vault — after every work session, on a cron schedule, or in `--watch` mode. Re-runs must update content without duplicating or destroying it.
 
-### Content-based diffing
+### The `<!-- defrag:end -->` sentinel system
 
-The `writeNote()` function in `obsidian.js` is the single point of all file I/O:
-
-```js
-function writeNote(filePath, content, { dryRun, verbose, stats }) {
-  if (dryRun) { stats.written++; return; }
-
-  if (fs.existsSync(filePath)) {
-    const existing = fs.readFileSync(filePath, 'utf8');
-    if (existing === content) { stats.skipped++; return; }
-  }
-
-  fs.writeFileSync(filePath, content, 'utf8');
-  stats.written++;
-}
-```
-
-The comparison is a full string equality check against the file content. This is O(n) in file size but files are small (typically < 10KB), and the check prevents unnecessary write syscalls and filesystem mtime updates. Unchanged notes report as `skipped` in the final summary.
-
-**Why not SHA hashing?** Full string comparison is faster for small files and requires no additional state. The current implementation does not maintain a content-hash index — it reads the existing file and compares directly. A future optimization for very large vaults could store hashes in `defrag.json` to avoid the file read on unchanged records.
-
-### The `<!-- defrag:end -->` marker system
-
-Every generated note reserves the content below a `<!-- defrag:end -->` comment for user annotations. On re-runs, the writer regenerates everything above the marker and preserves everything below it.
+Every generated note contains a `<!-- defrag:end -->` comment marking the boundary between auto-generated content (above) and user-authored content (below):
 
 ```markdown
-<!-- auto-generated above this line — do not edit -->
+## Related
+- [[concepts/osgi|OSGi]]
+
 <!-- defrag:end -->
 
-## My notes
+## My Notes
 
-This pattern came up again in the [[sessions/cursor-2025-06-01-dispatcher-config|June 1 Cursor session]].
-Worth reading the official OSGi spec on activation order before revisiting.
+This pattern came up again in the June dispatcher session.
+The OSGi spec section 6.2.4 is the authoritative reference here.
 ```
 
-The implementation: `writeNote()` checks for an existing file, splits on `<!-- defrag:end -->`, takes the user-written tail, appends it to the freshly generated head, and writes the result. If no marker exists in the existing file (i.e., the file was generated by an older version of the tool), the entire existing content is treated as auto-generated and overwritten.
+On re-run, `writeNote()` implements the merge logic:
 
-This design means users can safely annotate any note immediately after a run. Their annotations will survive all subsequent re-runs indefinitely.
+```js
+const SENTINEL = '<!-- defrag:end -->';
+const existingEnd = existing.indexOf(SENTINEL);
+const newEnd      = content.indexOf(SENTINEL);
+
+if (existingEnd !== -1 && newEnd !== -1) {
+  const existingTail = existing.slice(existingEnd + SENTINEL.length);
+  const newHead      = content.slice(0, newEnd + SENTINEL.length);
+  const merged       = newHead + existingTail;
+
+  if (merged === existing) { stats.skipped++; return; }
+
+  fs.writeFileSync(filePath, merged, 'utf8');
+  stats.written++;
+  return;
+}
+
+// No sentinel — fall back to exact-match idempotency
+if (existing === content) { stats.skipped++; return; }
+```
+
+The generated content above the sentinel is regenerated fresh every run. The user content below is extracted from the existing file and appended to the new head. If the result is identical to the existing file (nothing changed), the write is skipped.
+
+**This means users can safely annotate any note immediately after a run.** Their annotations survive all subsequent re-runs indefinitely. If a note is regenerated with different content above the sentinel (because new sessions were added), the user's notes below remain intact.
+
+**Notes without the sentinel** (e.g. generated by an older version of the tool): fall back to exact-match idempotency. The file is overwritten if content differs. User annotations in files without the sentinel will be lost on re-run — this is the migration path from pre-sentinel vault versions.
+
+### Content comparison
+
+The merge check compares the fully assembled `merged` string against `existing` using strict equality. This is O(n) in file size but files are small (typically 2–15 KB), and the equality check prevents unnecessary write syscalls and filesystem mtime updates. Unchanged notes are reported as `skipped` in the final summary.
 
 ### Session ID stability
 
-Session IDs are FNV-1a hashes of file paths (and for Claude Desktop format, file path + line index). As long as the source files don't move, IDs are stable. If a source file moves (e.g. Cursor updates its storage path), sessions will appear as new on the next run and the old session notes will remain as orphans. There is no merge step for relocated source files — this is acceptable because source storage paths rarely change.
+Session IDs are FNV-1a hashes of file paths. As long as source files don't move, IDs are stable across runs. If a source file moves (e.g. Cursor updates its storage path), sessions will appear as new on the next run and old session notes will remain as orphans — inert but harmless. There is no automatic cleanup of orphaned session notes; the vault is strictly additive.
 
 ### Concept note additivity
 
-The `buildConceptMap()` function in `obsidian.js` builds a fresh concept→sessions mapping on every run. The concept note renderer uses this fresh map, not a diff against the existing vault. This means concept notes are regenerated from scratch on each run. The `<!-- defrag:end -->` marker ensures user annotations below the marker survive regeneration.
+`buildConceptMap()` in `obsidian.js` builds a fresh concept→sessions mapping on every run from the full corpus. Concept notes are regenerated from scratch on each run. The sentinel system preserves user annotations. This means concept notes gain new sessions and decisions on each re-run without requiring explicit diff logic — the full regeneration is always correct, and the sentinel preserves manual work.
 
 ---
 
-## The `defrag.json` Manifest
+## 10. The `defrag.json` Manifest
 
 After each complete run, `defrag.json` is written to the vault root. It serves three distinct roles.
 
 ### Role 1 — Web visualizer data
 
-The GitHub Pages demo and the local web visualizer read `defrag.json` to populate the block-grid animation with real data. Rather than hardcoding fake counts, the visualizer reads `stats.sessions`, `stats.concepts`, `stats.snippets`, and `stats.links` from the manifest and drives the grid dimensions accordingly. The `topConcepts` array populates the concept ticker in the visualizer.
+The GitHub Pages demo and local web visualizer read `defrag.json` to populate the block-grid animation with real data. Rather than hardcoded fake counts, the visualizer reads `stats.sessions`, `stats.concepts`, `stats.snippets`, and `stats.links` and drives the grid dimensions accordingly. The `topConcepts` array populates the concept ticker in the visualizer.
 
 ### Role 2 — QMD collection metadata
 
@@ -810,15 +967,16 @@ QMD reads `defrag.json` to bootstrap its understanding of the vault before index
 
 ### Role 3 — Incremental run support (planned)
 
-The `generated` timestamp and per-source `lastProcessed` values are the foundation for `--since`-style incremental runs. A future implementation will read `defrag.json` on startup and automatically filter to sessions newer than `lastRun`, without requiring the user to pass `--since` manually. The per-source `lastProcessed` allows this to work correctly when only some sources have new data.
+The `generated` timestamp and per-source session counts are the foundation for automatic incremental runs. A future implementation will read `defrag.json` on startup and automatically apply a `--since` filter based on `generated`, without requiring the user to pass `--since` manually. Per-source counts allow this to work correctly when only some sources have new data.
 
-### Schema
+### Full schema
 
 ```json
 {
   "version": "1.0",
   "generated": "2025-06-01T14:23:41.000Z",
   "vault": "/Users/alice/vault",
+  "signalThreshold": 8,
   "model": "claude-opus-4-5",
   "sources": {
     "claude": {
@@ -856,24 +1014,25 @@ The `generated` timestamp and per-source `lastProcessed` values are the foundati
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `version` | string | Manifest schema version. Currently `"1.0"`. |
-| `generated` | ISO 8601 string | Timestamp of this run's completion. |
-| `vault` | string | Absolute path to the vault root. |
-| `model` | string? | Optional LLM model hint, set via `--model`. Not used by the pipeline; informational metadata for QMD. |
-| `sources[name].found` | boolean | Whether this source's storage root was found on disk. |
-| `sources[name].sessions` | number | Sessions read from this source on this run. |
-| `sources[name].path` | string | Display path used in CLI output and visualizer. |
+| `version` | string | Manifest schema version. Currently `"1.0"`. Increment on breaking changes. |
+| `generated` | ISO 8601 string | Timestamp of this run's completion. Used for incremental run support. |
+| `vault` | string | Absolute path to the vault root, as resolved by `path.resolve(opts.output)`. |
+| `signalThreshold` | number | The `--min-signal` value used for this run. Stored so re-runs can verify threshold consistency. |
+| `model` | string? | Optional LLM model hint, set via `--model`. Not used by the pipeline; informational metadata for QMD and the visualizer. |
+| `sources[name].found` | boolean | Whether this source's storage root was found on disk during this run. |
+| `sources[name].sessions` | number | Sessions successfully read from this source on this run (post-`--since` filter, pre-dedup). |
+| `sources[name].path` | string | Display path shown in CLI output and visualizer. Always present even when `found: false`. |
 | `stats.sessions` | number | Total sessions processed (post-deduplication). |
-| `stats.concepts` | number | Unique concept strings extracted across all sessions. |
-| `stats.snippets` | number | Total code snippets extracted. |
-| `stats.urls` | number | Total unique URLs extracted. |
-| `stats.links` | number | Wikilinks injected by the linker. |
-| `stats.filesWritten` | number | Vault files written (new or updated). |
-| `topConcepts` | string[] | Top 10 concepts by cross-session frequency, display-cased. |
+| `stats.concepts` | number | Unique concept strings extracted across all sessions (before signal filtering). |
+| `stats.snippets` | number | Total code snippets extracted across all sessions. |
+| `stats.urls` | number | Total unique URLs extracted across all sessions. |
+| `stats.links` | number | Wikilinks injected by the linker in this run. |
+| `stats.filesWritten` | number | Vault files written (new or updated) in this run. Does not include skipped files. |
+| `topConcepts` | string[] | Top 10 concepts by raw cross-session frequency, in display-cased form. Frequency is raw `conceptFreq` count, not signal score. |
 
 ---
 
-## Vault Structure Decisions
+## 11. Vault Structure Decisions
 
 ### Why `{source}-{date}-{title}` for session filenames?
 
@@ -882,24 +1041,34 @@ claude-2025-05-14-fix-osgi-bundle-activation.md
 cursor-2025-05-21-refactor-dispatcher-config.md
 ```
 
-The source prefix (`claude-`, `cursor-`) makes the tool origin visible at a glance in the file browser without opening the file. The date prefix ensures chronological sort in any alphabetically-sorted file tree. The title slug makes the filename human-readable without requiring you to open the file. The combination is unique without needing a UUID suffix in the common case.
+The source prefix (`claude-`, `cursor-`) makes the tool origin visible at a glance in any file browser without opening the file. The date prefix ensures chronological sort in alphabetically-sorted file trees (Obsidian's default). The title slug makes the filename human-readable without needing to open the file. The combination is collision-resistant in the common case without needing a UUID suffix.
+
+The slug is constructed as:
+```js
+session.title
+  .replace(/[^a-zA-Z0-9 ]+/g, ' ')
+  .replace(/\s+/g, '-')
+  .toLowerCase()
+  .slice(0, 50)
+  .replace(/-+$/, '')
+```
 
 ### Why a flat `concepts/` directory?
 
-Concept notes have no discoverable hierarchy. An auto-assigned taxonomy (grouping concepts by technology domain, for example) would be wrong enough of the time to be more confusing than helpful. Obsidian's graph view and backlinks provide the actual organizational structure. Users who want folder-based organization can move concept notes manually — wikilinks continue to resolve correctly via Obsidian's global link resolution.
+Concept notes have no discoverable hierarchy. An auto-assigned taxonomy (grouping concepts by technology domain) would be wrong enough of the time to be more confusing than helpful. Obsidian's graph view and backlinks provide the actual organizational structure. Users who want folder-based organization can move concept notes manually — Obsidian resolves wikilinks globally by note title, not by path, so moves don't break links.
 
 ### Why session notes by date, not by project?
 
-Sessions are atomic units of context. A session in a "my-rust-project" workspace might discuss TypeScript (because the user was comparing languages), OSGi (because they were reading docs), and Rust borrow checking (the main topic). Organizing by project forces a choice about which project the session "belongs to." Date-first organization avoids this: sessions are what they are, and cross-project grouping happens naturally through concept notes (which aggregate across all sessions mentioning a concept).
+Sessions are atomic units of context. A session in a "my-rust-project" workspace might discuss TypeScript (comparative analysis), OSGi (tangential docs reading), and Rust (main topic). Organizing by project forces a choice about which project a session "belongs to." Date-first organization avoids this: sessions are what they are. Cross-project grouping happens naturally through concept notes, which aggregate all sessions mentioning a concept regardless of their originating workspace.
 
 ### The `code/` directory
 
-Code snippets are extracted into standalone notes rather than inlined into session notes for two reasons:
+Code snippets are extracted into standalone notes in `code/` rather than inlined into session notes for two reasons:
 
 1. **Length**: code blocks can be hundreds of lines. Inlining them makes session notes unwieldy.
-2. **Reusability**: a useful code snippet might be referenced from multiple session notes and from concept notes. Standalone notes can be wikilinked from multiple places.
+2. **Reusability**: a useful code snippet might be referenced from multiple session notes and concept notes. Standalone notes can be wikilinked from multiple places; inline code cannot.
 
-Snippet notes are named `snippet-001.md`, `snippet-002.md` in global sequential order (not per-session). This keeps the `code/` directory flat and avoids the need to coordinate numbering across sessions.
+Snippet notes are named `snippet-001.md`, `snippet-002.md` in global sequential order across all sessions (not per-session). This keeps `code/` flat. The sequential index is assigned during the `write()` loop as `snippetIndex` increments across all sessions — the index is stable within a run but may change between runs if the session set changes. The snippet's `session` backlink is always present regardless of index changes.
 
 ### Frontmatter schema
 
@@ -910,6 +1079,8 @@ title: "Fix OSGi Bundle Activation"
 source: claude
 date: 2025-05-14T17:23:41.000Z
 turns: 24
+signal: 47
+concepts: 12
 tags: [session, claude]
 ---
 ```
@@ -917,10 +1088,13 @@ tags: [session, claude]
 **Concept notes:**
 ```yaml
 ---
-title: "OSGi"
-tags: [concept, claude]
-source: claude
-date: 2025-05-14
+title: "OSGi Bundle Lifecycle"
+tags: [concept, claude, cursor]
+signal: 24
+sessions: 6
+decisions: 3
+first-seen: 2025-02-14
+last-seen: 2025-05-21
 ---
 ```
 
@@ -935,11 +1109,11 @@ language: java
 ---
 ```
 
-The `source` field in all notes enables QMD's `--source` filter. The `tags` field powers Obsidian's tag-based navigation. The `date` field is indexed as a sortable facet.
+The `source` field enables QMD's `--source` filter. The `tags` field powers Obsidian's tag-based navigation. The `signal`, `sessions`, and `decisions` fields on concept notes are indexed as numeric facets by QMD, enabling queries like "concepts with more than 3 decisions."
 
 ---
 
-## QMD Integration
+## 12. QMD Integration
 
 QMD is the semantic search companion to `context-defrag`. After running `context-defrag`, users run:
 
@@ -962,27 +1136,28 @@ qmd query "your question here"
 The vault is designed to be a good QMD input:
 
 - **Structured front-matter**: filterable metadata on every file
-- **Short, focused notes**: concept notes are typically 200–500 words — the right size for embedding
+- **Short, focused notes**: concept notes are typically 200–500 words — the right granularity for embeddings
 - **Explicit links**: wikilinks create a graph structure that QMD can use for link-based re-ranking
 - **Stable paths**: filenames are deterministic, so QMD's incremental indexing (comparing content hashes) works correctly across re-runs
 
 ### Collections
 
-| Vault directory | QMD collection | Indexing notes |
-|-----------------|----------------|----------------|
-| `sessions/`     | `sessions`     | Indexed by date, source, concept list |
-| `concepts/`     | `concepts`     | Primary semantic documents — highest embedding quality |
-| `code/`         | `snippets`     | Language-aware tokenization; code content weighted higher |
-| `links.md`      | `links`        | URL index; useful for "find where I referenced X docs" |
-| `_timeline.md`  | `meta`         | Structural document; typically excluded from semantic search |
+| Vault directory | QMD collection | Notes |
+|-----------------|----------------|-------|
+| `sessions/` | `sessions` | Indexed by date, source, concept count, signal score |
+| `concepts/` | `concepts` | Primary semantic documents — highest embedding quality |
+| `code/` | `snippets` | Language-aware tokenization; code content weighted higher |
+| `links.md` | `links` | URL index; useful for "find where I referenced X docs" |
+| `_timeline.md` | `meta` | Structural document; typically excluded from semantic search |
+| `_low-signal.md` | `meta` | Term index; useful for full-corpus search, not semantic |
 
 ---
 
-## Extension Points
+## 13. Extension Points
 
 ### Adding a new miner
 
-1. Create `cli/miners/<toolname>.js` implementing:
+1. Create `cli/miners/<toolname>.js` implementing the standard interface:
 
 ```js
 'use strict';
@@ -997,19 +1172,23 @@ const os   = require('os');
  * sessions: Array of normalized Session objects:
  * {
  *   source:    '<toolname>',
- *   id:        string,          // stable hash derived from file path
- *   filePath:  string,          // original source file path
+ *   id:        string,          // stable FNV-1a hash derived from file path
+ *   filePath:  string,          // original source file path (provenance)
  *   title:     string,          // ≤80 chars, human readable
  *   timestamp: Date,            // session start time
  *   messages:  Message[],       // [{ role, content, timestamp? }]
  *   turnCount: number,
+ *   // optional: workspacePath for cross-project scoring
  * }
+ *
+ * Return { source, sessions: [], skipped: [rootPath] } if source not found.
+ * Return { source, sessions: [] } with no skipped if found but empty.
  */
 async function mine({ since, verbose } = {}) {
-  // Discover source files
-  // Parse them into Session objects
-  // Apply since filter: if (since && session.timestamp < since) continue;
-  // Return:
+  // 1. Discover source files/databases
+  // 2. Parse into normalized Session objects
+  // 3. Apply since filter: if (since && session.timestamp < since) continue;
+  // 4. Deduplicate internally if multiple sources can yield the same session
   return { source: '<toolname>', sessions };
 }
 
@@ -1028,28 +1207,29 @@ const MINER_MAP = {
   mytool: myToolMiner,           // ← add here
 };
 
-const ALL_SOURCES = ['claude', 'codex', 'cursor', 'mytool'];
+const ALL_SOURCES = ['claude', 'codex', 'cursor', 'mytool'];  // ← add here
 
 const SOURCE_DISPLAY_PATHS = {
-  // ...
+  claude: '~/.claude/projects/',
+  codex:  '~/.codex/',
+  cursor: '~/Library/Application Support/Cursor/',
   mytool: '~/.mytool/',          // ← add here
 };
 ```
 
 3. Add the source to the `--sources` option documentation in `printHelp()`.
 
-**Important contract**: The `id` field must be stable and unique. Use a hash of the file path (FNV-1a as used by existing miners). If your source stores multiple conversations per file, incorporate a stable per-conversation identifier (UUID, line index) into the hash input.
+**Critical contract**: The `id` field must be stable and unique across runs. Use FNV-1a hash over a stable file path as used by existing miners. If your source stores multiple conversations per file (like Claude Desktop format), incorporate a stable per-conversation identifier (UUID or deterministic line index) into the hash input. An unstable ID will cause session notes to be re-created as new notes on every run.
 
 ---
 
 ### Adding a new extraction heuristic
 
-The extraction engine is in `cli/extractor.js`. The `extract()` function is the entry point:
+The extraction engine in `cli/extractor.js` has a clean extension pattern. The `extract()` function is the entry point:
 
 ```js
 function extract(session) {
   const fullText = session.messages.map((m) => m.content).join('\n\n');
-
   return {
     concepts:  extractConcepts(fullText),
     decisions: extractDecisions(session.messages),
@@ -1063,51 +1243,61 @@ function extract(session) {
 
 To add a new extraction type:
 
-1. Write an `extractX(text | messages)` function in `extractor.js` following the existing patterns.
+1. Write an `extractX(text | messages)` function in `extractor.js` following the existing patterns. Keep it pure — no I/O, no side effects.
 2. Add the result to the returned object in `extract()`.
-3. Add the field to the `signalScore` formula if it should influence tiering (update `computeSignalScore()`).
+3. If it should influence signal scoring, add a counter for it in `computeSignalScore()` and update the formula.
 4. Update `renderSessionNote()` in `obsidian.js` to include the new field in session notes.
-5. Update `renderConceptNote()` if concepts should aggregate the new field.
+5. Update `renderConceptNote()` in `obsidian.js` if concepts should aggregate the new field.
+6. Update `defrag.json` manifest generation in `defrag.js` if it should appear in stats.
 
-The extraction system's contract is: **pure functions, no side effects, no I/O**. `extract()` takes a session object and returns a plain data object. This makes extraction trivially testable and safely parallelizable.
+The extraction system's contract is: **pure functions, no side effects, no I/O.** `extract()` takes a session object and returns a plain data object. This makes extraction trivially testable (`assert.deepEqual(extract(mockSession), expected)`) and safely parallelizable if a future version adds concurrency.
 
 ---
 
 ### Adding a new note type
 
-The writer (`cli/writers/obsidian.js`) has a clear pattern for adding new note types:
+The writer in `cli/writers/obsidian.js` has a clear pattern for adding new note types:
 
-1. Write a `renderXNote(data, context)` function that returns a Markdown string with YAML frontmatter.
-2. Add a section to `write()` that calls `renderXNote()` for each relevant data item and calls `writeNote()` with the result.
-3. Create the directory in `write()`'s directory setup block:
+1. Write a `renderXNote(data, context)` function returning a Markdown string with YAML frontmatter. End the generated section with `<!-- defrag:end -->\n` so user annotations are preserved.
+2. Add a section to `write()` that calls `renderXNote()` for each relevant data item and passes the result to `writeNote()`.
+3. Create the directory in `write()`'s setup block:
    ```js
    ensureDir(path.join(outputDir, 'mytype'));
    ```
-4. Register the new directory with the linker: the linker's `collectMarkdownFiles()` walks the entire vault tree recursively, so new directories are picked up automatically with no changes to `linker.js`.
-5. If the new note type should be indexed separately by QMD, document the new collection in the QMD Integration section.
+4. The linker's `collectMarkdownFiles()` walks the entire vault tree recursively — new directories and their files are automatically picked up for link injection with no changes to `linker.js`.
+5. If the new note type should appear in `defrag.json` stats, add a counter in `defrag.js`'s stats aggregation.
+6. Document the new QMD collection in the [QMD Integration](#12-qmd-integration) section.
 
 ---
 
-### Tuning the stopword lists
+### Adding a new signal scoring factor
 
-Three lists control what gets filtered at extraction time:
-
-**`CONCEPT_STOPWORDS`** (`extractor.js`): Terms filtered before concept scoring. Add terms that appear frequently in your sessions but carry no signal. These should be programming constructs, generic English nouns, and structural terms.
-
-**`STOP_PHRASES`** (`extractor.js`): Title-case multi-word phrases that look like concepts but are actually English connectives. The pattern `TITLE_CASE_RE` is aggressive — it catches everything like "The Following" and "It Is" — so this list prevents those from reaching the concept stage.
-
-**`KEYWORD_DISPLAY`** (`extractor.js`): The canonical display form for known-casing terms. If you add a new entry to `TECH_KEYWORDS`, add its display form here. Without a display entry, the term will appear lowercased in concept notes (e.g., `graphql` instead of `GraphQL`).
-
----
-
-### Adjusting the signal weights
-
-The signal scoring constants are in `computeSignalScore()` in `extractor.js`:
+The signal scoring formula is in `computeSignalScore()` in `extractor.js`:
 
 ```js
 return (sessionCount * 2) + (decisionCount * 5) + (codeCount * 3) + (crossProjectCount * 4);
 ```
 
-If your workflow is heavily code-focused and you want code evidence weighted more highly, increase the `codeCount` multiplier. If you work primarily in a single project/workspace and `crossProjectCount` is always 1, you may want to reduce that weight and increase `decisionCount` weight to compensate.
+To add a new factor (e.g. `urlCount` — concepts that appear near referenced URLs):
 
-The default threshold (`--min-signal 8`) should be re-evaluated after weight changes. A useful calibration approach: run with `--dry-run --verbose` and examine which concepts sit just above and just below the threshold; adjust weights or threshold until the boundary feels right for your corpus.
+1. Add the counter to the accumulation loop in `computeSignalScore()`.
+2. Choose a weight. Use the existing weight rationale as a guide: how confident are you that this signal indicates genuine knowledge crystallization? Compare to the existing factors: is it stronger or weaker evidence than a decision sentence? A code co-occurrence?
+3. Update the formula comment in the source file.
+4. Update the `--min-signal` documentation in `defrag.js → printHelp()`.
+5. Re-calibrate the default threshold if the new factor significantly changes the score distribution. A useful approach: run with `--dry-run --verbose` on a known corpus before and after the change and compare the count of concepts above the threshold.
+
+---
+
+### Tuning the stopword and keyword lists
+
+Three lists in `extractor.js` control what gets extracted and how:
+
+**`CONCEPT_STOPWORDS`**: Terms filtered before concept scoring. Add terms that appear frequently in your sessions but carry no signal. These should be programming constructs, generic English nouns in developer contexts, and structural terms. Removing a term from this list will allow it to be scored and potentially promoted to a concept note.
+
+**`STOP_PHRASES`**: Title-case multi-word phrases that look like concepts but are English connectives. The `TITLE_CASE_RE` pattern is intentionally aggressive — it catches everything with two or more capitalized words, including "The Following" and "It Is" — so this list prevents those from being scored. Add phrases that appear in your corpus and produce false positives.
+
+**`TECH_KEYWORDS`** + **`KEYWORD_DISPLAY`**: The canonical tech keyword list and their display-cased forms. To add a new technology:
+1. Add the lowercase term to `TECH_KEYWORDS`.
+2. Add `'lowercase': 'DisplayForm'` to `KEYWORD_DISPLAY`. Without a display entry, the term will appear lowercased in concept notes (e.g., `mytech` instead of `MyTech`).
+
+Note that `TECH_KEYWORDS` matches exact word boundaries — adding `'nextjs'` matches "nextjs" but not "next.js". The display entry `'nextjs': 'Next.js'` handles the display form. If your technology name contains punctuation, add both the sanitized form (for matching) and ensure the display form is set.
