@@ -1,0 +1,12 @@
+{
+  "theme": "obsidian",
+  "baseFontSize": 16,
+  "textFontFamily": "",
+  "monospaceFontFamily": "JetBrains Mono, Fira Code, Cascadia Code, Courier New, monospace",
+  "interfaceFontFamily": "",
+  "translucency": false,
+  "nativeScrollbars": false,
+  "colorScheme": "moonstone",
+  "accentColor": "#4a9eff",
+  "cssTheme": ""
+}

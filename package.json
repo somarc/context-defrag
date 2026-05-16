@@ -1,0 +1,23 @@
+{
+  "name": "context-defrag",
+  "version": "1.0.0",
+  "description": "Mine LLM session context files from macOS and produce an Obsidian markdown vault",
+  "main": "cli/defrag.js",
+  "bin": {
+    "defrag": "./cli/defrag.js"
+  },
+  "scripts": {
+    "start": "node cli/defrag.js",
+    "defrag": "node cli/defrag.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "glob": "^10.3.10"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": ["darwin"],
+  "keywords": ["llm", "obsidian", "context", "cli", "mining"],
+  "license": "MIT"
+}
