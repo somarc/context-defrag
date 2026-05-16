@@ -1,0 +1,14 @@
+node_modules/
+
+# Default vault output location — never commit your personal context data
+vault/
+
+# defrag.json manifest (contains local paths)
+defrag.json
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
