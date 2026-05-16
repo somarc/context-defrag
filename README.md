@@ -14,7 +14,7 @@
 ║   ██████╔╝███████╗██║     ██║  ██║██║  ██║╚██████╔╝              ║
 ║   ╚═════╝ ╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝               ║
 ╠═══════════════════════════════════════════════════════════════════╣
-║  Microsoft(R) Context Defragmenter    Version 1.0                 ║
+║  Definitely Not Microsoft(R) Context Defragmenter   Version 1.0  ║
 ║  Copyright (C) context-defrag contributors, 2026.                 ║
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
@@ -77,7 +77,7 @@ The terminal UI is a faithful recreation of the MS-DOS 6.x Disk Defragmenter, re
 
 ```
   ╔══════════════════════════════════════════════════════════════╗
-  ║  Microsoft(R) Context Defragmenter          Drive C: 87%    ║
+  ║  Definitely Not Microsoft(R) Context Defragmenter            ║
   ╠══════════════════════════════════════════════════════════════╣
   ║                                                              ║
   ║  ████████████████████████▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  ║
