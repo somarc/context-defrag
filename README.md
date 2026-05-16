@@ -67,7 +67,7 @@ Node 18-21 works but Cursor chat history will be skipped.
 npx context-defrag --dry-run --verbose
 ```
 
-This scans all sources and reports what would be extracted — sessions found, concepts identified, files that would be written — without touching your filesystem. Run this first. It's fast.
+This scans all sources and reports what would be extracted — sessions found, concepts identified, files that would be written — without touching your filesystem. Run this first. It completes in seconds. The real run, which writes thousands of markdown files and injects wikilinks across the entire vault, takes significantly longer depending on how many sessions you have.
 
 ### Step 2: Choose where your vault will live
 
