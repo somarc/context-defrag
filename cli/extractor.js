@@ -708,6 +708,7 @@ function escapeRegex(str) {
 module.exports = {
   extract,
   computeSignalScore,
+  computeRecencyBonus,
   classifyDecisionPattern,
   computeDecisionPatternDiversity,
   extractConceptDecisions,
