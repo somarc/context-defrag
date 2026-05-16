@@ -44,24 +44,78 @@
 
 Your LLM conversations are a fragmented disk — the same insights scattered across hundreds of JSON files and SQLite databases, unlinked and unsearchable, decaying in `~/Library`. `context-defrag` reads your Claude, Cursor, and Codex session histories and reorganizes them into a structured [Obsidian](https://obsidian.md) knowledge vault with bidirectional wikilinks, extracted concepts, and a full session timeline.
 
+Your vault is never uploaded anywhere. All processing happens locally on your machine.
+
 One command. Permanent knowledge.
 
 ---
 
 ## Quick start
 
-```bash
-npx context-defrag
+### Step 0: Check your Node version
+
+```
+Node 22+ recommended — uses built-in node:sqlite for Cursor mining.
+Node 18-21 works but Cursor chat history will be skipped.
 ```
 
-Or install globally:
+`context-defrag` uses `node:sqlite` (built into Node 22+) to read Cursor's SQLite databases without any native compilation or external dependencies. On Node 18–21, Cursor mining is skipped gracefully and everything else works fine. On Node 22+ (including the current Node 25), everything works.
+
+### Step 1: Preview what will be found (nothing is written)
 
 ```bash
+npx context-defrag --dry-run --verbose
+```
+
+This scans all sources and reports what would be extracted — sessions found, concepts identified, files that would be written — without touching your filesystem. Run this first. It's fast.
+
+### Step 2: Choose where your vault will live
+
+**This matters.** The `--output` flag controls where the vault is written. The default is `./vault`, which puts it inside whatever directory you ran the command from. That's fine for a test run, but for real use you want a dedicated location you'll actually keep.
+
+The vault is gitignored by default (`vault/` is in `.gitignore`), but you should still keep it outside any repo — treat it like `~/.ssh`, not like source code.
+
+```bash
+# Recommended: dedicated folder in your home directory
+node cli/defrag.js --output ~/llm-context
+
+# If you use Obsidian already
+node cli/defrag.js --output ~/Documents/ObsidianVaults/llm-context
+
+# Then open in Obsidian: File → Open Folder as Vault → select the output folder
+```
+
+Pick a path once, keep using it. Re-runs are safe and fast — unchanged notes are skipped, and any content you add below `<!-- defrag:end -->` markers is preserved.
+
+### Step 3: Run for real
+
+```bash
+# via npx (no install required)
+npx context-defrag --output ~/llm-context
+
+# or install globally
 npm install -g context-defrag
-context-defrag
+context-defrag --output ~/llm-context
 ```
 
-Then open the `./vault` directory in Obsidian as a new vault. The graph view loads immediately.
+Then open the output directory in Obsidian: **File → Open Folder as Vault**. The graph view loads immediately.
+
+---
+
+## Understanding the output
+
+First-time users are often surprised by the numbers. This is what they mean:
+
+```
+Sessions processed:  196   ← conversations found across all sources
+Concepts extracted: 8334   ← unique technical terms, tools, and phrases
+Code snippets:      2063   ← fenced code blocks extracted to vault/code/
+URLs found:         3607   ← links mentioned, grouped in vault/links.md
+Links created:       891   ← [[wikilinks]] injected between related notes
+Files written:     10548   ← total markdown files in the vault
+```
+
+Large numbers are normal and expected. A developer who uses Claude daily for a year will have hundreds of sessions and thousands of extracted concepts. The vault is designed to handle this — Obsidian's graph view and search scale well into the tens of thousands of notes.
 
 ---
 
@@ -245,7 +299,7 @@ struct MyStruct {
 npm install -g qmd
 
 # 2. Index your vault
-qmd index ./vault
+qmd index ~/llm-context
 
 # 3. Ask a question
 qmd query "how did I fix the borrow checker error in my Rust project?"
@@ -329,10 +383,10 @@ context-defrag [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--output <path>` | `./vault` | Output vault directory. Defaults to `./vault` inside the current directory — recommended to set this to a path outside any repo, e.g. `~/llm-context` |
 | `--sources <list>` | `claude,codex,cursor` | Comma-separated list of sources to mine |
-| `--out <path>` | `./vault` | Output vault directory |
 | `--since <duration>` | *(all time)* | Only process conversations newer than e.g. `30d`, `2w` |
-| `--dry-run` | `false` | Scan and extract but write nothing |
+| `--dry-run` | `false` | Scan and extract but write nothing — good first step before a real run |
 | `--verbose` | `false` | Print every cluster assignment |
 | `--update` | `false` | Re-run and update existing notes (idempotent) |
 | `--fuzzy-links` | `false` | Enable fuzzy wikilink matching (Levenshtein ≤ 2) |
@@ -340,6 +394,8 @@ context-defrag [options]
 | `--include-tool-calls` | `false` | Include tool-use and tool-result turns in extraction |
 | `--concepts <path>` | *(none)* | Path to a custom `concepts.json` dictionary |
 | `--config <path>` | `./config.json` | Path to config file |
+
+> **Note:** `--out` is accepted as an alias for `--output` for compatibility, but `--output` is the canonical flag name.
 
 ---
 
