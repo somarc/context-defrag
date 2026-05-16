@@ -271,16 +271,103 @@ function extractEntities(text) {
 }
 
 // ── Signal scoring ────────────────────────────────────────────────────────────
+
+// ── Decision pattern classification keywords ──────────────────────────────────
+const DECISION_PATTERN_KEYWORDS = {
+  CHOICE:       /\b(decided|going with|chosen|opted for|will use|we'?ll use|going to use)\b/i,
+  AVOIDANCE:    /\b(avoid|don'?t use|not using|rejected|against|won'?t use|shouldn'?t use)\b/i,
+  EVOLUTION:    /\b(switched|migrated|replaced|moved away from|deprecated|refactored away)\b/i,
+  CONFIRMATION: /\b(confirmed|still using|keeping|sticking with|continuing with|works well)\b/i,
+};
+
+/**
+ * Classify a single decision sentence into a pattern type.
+ *
+ * @param {string} sentence
+ * @returns {'CHOICE'|'AVOIDANCE'|'EVOLUTION'|'CONFIRMATION'|null}
+ */
+function classifyDecisionPattern(sentence) {
+  if (!sentence) return null;
+  for (const [type, re] of Object.entries(DECISION_PATTERN_KEYWORDS)) {
+    if (re.test(sentence)) return type;
+  }
+  return null;
+}
+
+/**
+ * Compute the number of distinct decision pattern types found for a concept
+ * across all sessions (0–4).
+ *
+ * @param {string} concept      - The concept string (case-insensitive match)
+ * @param {Array}  sessionItems - Array of { session, extracted } objects
+ * @returns {number}
+ */
+function computeDecisionPatternDiversity(concept, sessionItems) {
+  if (!concept || !Array.isArray(sessionItems)) return 0;
+
+  const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const foundTypes = new Set();
+
+  for (const item of sessionItems) {
+    if (!item || !item.extracted) continue;
+    for (const decision of (item.extracted.decisions || [])) {
+      if (!re.test(decision)) continue;
+      const type = classifyDecisionPattern(decision);
+      if (type) foundTypes.add(type);
+    }
+  }
+
+  return foundTypes.size;
+}
+
+/**
+ * Compute a relative recency bonus for a concept.
+ * Returns 1.5 if the concept appears in any session in the top-quartile
+ * (p75) of timestamps across allSessions, otherwise 0.
+ * Guard: requires at least 20 sessions to avoid noise on small datasets.
+ *
+ * @param {string} conceptKey   - The concept string (case-insensitive)
+ * @param {Array}  sessionItems - Array of { session, extracted } for sessions mentioning this concept
+ * @param {Array}  allSessions  - Full array of { session, extracted } objects (all sessions)
+ * @returns {number}
+ */
+function computeRecencyBonus(conceptKey, sessionItems, allSessions) {
+  // Only meaningful with enough history
+  if (!allSessions || allSessions.length < 20) return 0;
+
+  // Compute p75 timestamp across all sessions (relative to this user's data)
+  const timestamps = allSessions
+    .map(s => {
+      const ts = s.session ? s.session.timestamp : null;
+      return ts instanceof Date ? ts.getTime() : 0;
+    })
+    .filter(t => t > 0)
+    .sort((a, b) => a - b);
+
+  const p75 = timestamps[Math.floor(timestamps.length * 0.75)] || 0;
+  if (p75 === 0) return 0;
+
+  // Check if this concept appears in any session in the top quartile
+  const hasRecentSession = sessionItems.some(({ session }) => {
+    const t = session.timestamp instanceof Date ? session.timestamp.getTime() : 0;
+    return t >= p75;
+  });
+
+  return hasRecentSession ? 1.5 : 0;
+}
+
 /**
  * Compute a signal score for a concept across all sessions.
  *
- * signalScore = (sessionCount * 2) + (decisionCount * 5) + (codeCount * 3) + (crossProjectCount * 4)
+ * signalScore = (sessionCount × 2) + (decisionCount × 5) + (codeCount × 3)
+ *            + (crossProjectCount × 4) + (decisionPatternDiversity × 2) + recencyBoost
  *
  * @param {string}  concept      - The concept string (case-insensitive match)
  * @param {Array}   sessionItems - Array of { session, extracted } objects
+ * @param {Array}   [allSessions] - Full session list for recency calculation (optional)
  * @returns {number}
  */
-function computeSignalScore(concept, sessionItems) {
+function computeSignalScore(concept, sessionItems, allSessions) {
   if (!concept || !Array.isArray(sessionItems)) return 0;
 
   const conceptLower = concept.toLowerCase();
@@ -290,6 +377,9 @@ function computeSignalScore(concept, sessionItems) {
   let decisionCount    = 0;
   let codeCount        = 0;
   const projectSources = new Set();
+
+  // Collect only the sessionItems where this concept appears (for recency check)
+  const conceptSessionItems = [];
 
   for (const item of sessionItems) {
     if (!item || !item.session || !item.extracted) continue;
@@ -303,6 +393,7 @@ function computeSignalScore(concept, sessionItems) {
     if (!appearsInSession) continue;
 
     sessionCount++;
+    conceptSessionItems.push(item);
 
     // Count decision sentences mentioning this concept
     for (const d of (extracted.decisions || [])) {
@@ -320,9 +411,17 @@ function computeSignalScore(concept, sessionItems) {
     if (session.workspacePath) projectSources.add(session.workspacePath);
   }
 
-  const crossProjectCount = projectSources.size;
+  const crossProjectCount        = projectSources.size;
+  const decisionPatternDiversity = computeDecisionPatternDiversity(concept, conceptSessionItems);
+  // allSessions may be omitted for backward compatibility — recencyBonus falls back to 0
+  const recencyBoost             = computeRecencyBonus(conceptLower, conceptSessionItems, allSessions || null);
 
-  return (sessionCount * 2) + (decisionCount * 5) + (codeCount * 3) + (crossProjectCount * 4);
+  return (sessionCount * 2)
+       + (decisionCount * 5)
+       + (codeCount * 3)
+       + (crossProjectCount * 4)
+       + (decisionPatternDiversity * 2)
+       + recencyBoost;
 }
 
 // ── Concept decision attribution ──────────────────────────────────────────────
@@ -609,6 +708,8 @@ function escapeRegex(str) {
 module.exports = {
   extract,
   computeSignalScore,
+  classifyDecisionPattern,
+  computeDecisionPatternDiversity,
   extractConceptDecisions,
   extractConceptExcerpts,
   extractSessionNarrative,

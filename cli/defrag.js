@@ -191,6 +191,7 @@ async function runPipeline(opts) {
     writeStats = write({
       outputDir:       opts.output,
       sessions:        enriched,
+      allSessions:     enriched,   // full enriched list passed for recency scoring
       dryRun:          opts.dryRun,
       verbose:         opts.verbose,
       signalThreshold: opts.minSignal,

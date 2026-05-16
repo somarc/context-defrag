@@ -19,6 +19,9 @@ const path = require('path');
 
 const {
   computeSignalScore,
+  classifyDecisionPattern,
+  computeDecisionPatternDiversity,
+  computeRecencyBonus,
   extractConceptDecisions,
   extractConceptExcerpts,
   extractSessionNarrative,
@@ -32,16 +35,20 @@ const DEFAULT_SIGNAL_THRESHOLD = 8;
  * @param {Object}  opts
  * @param {string}  opts.outputDir        - Root vault directory
  * @param {Array}   opts.sessions         - Array of { session, extracted } objects
+ * @param {Array}   [opts.allSessions]    - Full session list (for recency scoring); falls back to sessions
  * @param {boolean} opts.dryRun           - If true, log what would be written
  * @param {boolean} opts.verbose
  * @param {number}  [opts.signalThreshold] - Minimum signal score for a standalone concept note (default: 8)
  * @returns {{ written: number, skipped: number }}
  */
-function write({ outputDir, sessions, dryRun, verbose, signalThreshold }) {
-  const stats     = { written: 0, skipped: 0 };
-  const threshold = (typeof signalThreshold === 'number' && isFinite(signalThreshold))
+function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThreshold }) {
+  const stats        = { written: 0, skipped: 0 };
+  const threshold    = (typeof signalThreshold === 'number' && isFinite(signalThreshold))
     ? signalThreshold
     : DEFAULT_SIGNAL_THRESHOLD;
+  // allSessions: the full enriched list used for cross-session recency scoring.
+  // Falls back to the sessions array itself for backward compatibility.
+  const fullSessions = Array.isArray(allSessions) ? allSessions : sessions;
 
   if (!dryRun) {
     ensureDir(outputDir);
@@ -66,12 +73,12 @@ function write({ outputDir, sessions, dryRun, verbose, signalThreshold }) {
   const lowSignalConcepts = [];  // { concept, sessionCount }
 
   for (const [concept, mentionedIn] of conceptMap.entries()) {
-    const score = computeSignalScore(concept, sessions);
+    const score = computeSignalScore(concept, sessions, fullSessions);
 
     if (score >= threshold) {
       const fileName = slugify(concept) + '.md';
       const filePath = path.join(outputDir, 'concepts', fileName);
-      const content  = renderConceptNote(concept, mentionedIn, sessions, score);
+      const content  = renderConceptNote(concept, mentionedIn, sessions, score, fullSessions);
       writeNote(filePath, content, { dryRun, verbose, stats });
     } else {
       lowSignalConcepts.push({ concept, sessionCount: mentionedIn.length });
@@ -207,9 +214,16 @@ ${entitySection}
 /**
  * Render an upgraded concept note with signal score, Key Decisions,
  * Context & Excerpts, Code Context, and sorted session list.
+ *
+ * @param {string}  concept         - Concept key (lowercase / canonical)
+ * @param {Array}   mentionedIn     - Array of session IDs that mention this concept
+ * @param {Array}   allSessions     - Array of { session, extracted } for sessions mentioning this concept
+ * @param {number}  signalScore     - Pre-computed signal score
+ * @param {Array}   [allSessionsFull] - Full session list (for recency bonus); falls back to allSessions
  */
-function renderConceptNote(concept, mentionedIn, allSessions, signalScore) {
-  const score = (typeof signalScore === 'number') ? signalScore : 0;
+function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSessionsFull) {
+  const score           = (typeof signalScore === 'number') ? signalScore : 0;
+  const fullSessions    = Array.isArray(allSessionsFull) ? allSessionsFull : allSessions;
 
   // ── Gather sessions in scope ──────────────────────────────────────────────
   const sessionEntries = mentionedIn
@@ -227,6 +241,26 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore) {
   const sources = [...new Set(sessionEntries.map(({ session }) => session.source))];
 
   const displayName = titleCase(concept);
+
+  // ── New signal enhancement fields ─────────────────────────────────────────
+
+  // Recency bonus (uses full session list for p75 calculation)
+  const recencyBoost = computeRecencyBonus(concept, sessionEntries, fullSessions);
+  const recentlyActive = recencyBoost > 0;
+
+  // Decision pattern diversity
+  const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const foundPatternTypes = new Set();
+  for (const item of sessionEntries) {
+    if (!item || !item.extracted) continue;
+    for (const decision of (item.extracted.decisions || [])) {
+      if (!re.test(decision)) continue;
+      const type = classifyDecisionPattern(decision);
+      if (type) foundPatternTypes.add(type);
+    }
+  }
+  const decisionPatternDiversity = foundPatternTypes.size;
+  const patternList = [...foundPatternTypes]; // e.g. ['CHOICE', 'AVOIDANCE']
 
   // ── YAML frontmatter ─────────────────────────────────────────────────────
   const tagList = ['concept', ...sources].join(', ');
@@ -259,9 +293,9 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore) {
   const codeEntries = [];
   for (const { session, extracted } of allSessions) {
     if (!mentionedIn.includes(session.id)) continue;
-    const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+    const codeRe = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
     for (const snippet of (extracted.snippets || [])) {
-      if (snippet && snippet.code && re.test(snippet.code)) {
+      if (snippet && snippet.code && codeRe.test(snippet.code)) {
         const paddedIdx = String(snippet.index + 1).padStart(3, '0');
         const label     = deriveSnippetLabel(snippet.code);
         codeEntries.push(`- [[code/snippet-${paddedIdx}]] — ${snippet.lang || 'text'}${label ? ` — ${label}` : ''}`);
@@ -289,21 +323,61 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore) {
     })
     .join('\n') || '_No sessions found_';
 
+  // ── Signal breakdown comment ──────────────────────────────────────────────
+  // Decompose the score back into its components for the breakdown string.
+  // We recompute sessionCount/decisionCount/codeCount locally rather than
+  // re-running computeSignalScore so we can surface the raw numbers cheaply.
+  let _sessionCount  = 0;
+  let _decisionCount = 0;
+  let _codeCount     = 0;
+  for (const item of sessionEntries) {
+    if (!item || !item.extracted) continue;
+    _sessionCount++;
+    for (const d of (item.extracted.decisions || [])) {
+      if (re.test(d)) _decisionCount++;
+    }
+    for (const snippet of (item.extracted.snippets || [])) {
+      if (snippet && snippet.code && re.test(snippet.code)) _codeCount++;
+    }
+  }
+  const signalBreakdown = `s:${_sessionCount} d:${_decisionCount} c:${_codeCount} p:${decisionPatternDiversity} r:${recencyBoost}`;
+
+  // ── Badge line (shown under H1 in promoted notes) ─────────────────────────
+  let badgeParts = [];
+  if (patternList.length > 0) {
+    badgeParts.push(`Decision patterns: ${patternList.join(' · ')}`);
+  }
+  if (recentlyActive) {
+    badgeParts.push('Recently active');
+  }
+  const badgeLine = badgeParts.length > 0
+    ? `> ${badgeParts.join('  |  ')}\n`
+    : '';
+
   // ── Assemble note ─────────────────────────────────────────────────────────
   const parts = [];
 
-  parts.push(`---
-title: "${escYaml(displayName)}"
-tags: [${tagList}]
-signal: ${score}
-sessions: ${mentionedIn.length}
-decisions: ${conceptDecisions.length}
-${firstDate ? `first-seen: ${firstDate}` : ''}
-${lastDate  ? `last-seen: ${lastDate}`   : ''}
----
+  // Build frontmatter lines, omitting empty optional fields cleanly
+  const fmLines = [
+    `title: "${escYaml(displayName)}"`,
+    `tags: [${tagList}]`,
+    `signal: ${score}`,
+    `sessions: ${mentionedIn.length}`,
+    `decisions: ${conceptDecisions.length}`,
+    firstDate ? `first-seen: ${firstDate}` : '',
+    lastDate  ? `last-seen: ${lastDate}`   : '',
+    `recently-active: ${recentlyActive}`,
+    patternList.length > 0
+      ? `decision-patterns: [${patternList.join(', ')}]`
+      : 'decision-patterns: []',
+    `signal-breakdown: "${signalBreakdown}"`,
+  ].filter(Boolean).join('\n');
 
-# ${displayName}
-`);
+  parts.push(`---\n${fmLines}\n---\n\n# ${displayName}\n`);
+
+  if (badgeLine) {
+    parts.push(badgeLine);
+  }
 
   if (decisionsSection) {
     parts.push(`## Key Decisions\n${decisionsSection}\n`);
