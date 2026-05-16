@@ -100,8 +100,24 @@ const DECISION_PATTERNS = [
   /\b(don('t| not) use|avoid|drop|remove|replace|migrate (from|away))\b/i,
 ];
 
+// ── Sentences that signal a strong excerpt (decision or problem framing) ─────
+const EXCERPT_SIGNAL_PATTERNS = [
+  // Decision language
+  /\b(decided|will use|going with|avoid|chosen|don't use|do not use|opted for|settled on)\b/i,
+  // Problem framing
+  /\b(issue|problem|failing|broken|slow|error|bug|crash|failing)\b/i,
+  // Code context
+  /\b(function|method|class|returns|throws|implements|extends|interface)\b/i,
+];
+
+// ── Conclusion / recommendation language (for session narrative) ─────────────
+const CONCLUSION_PATTERNS = [
+  /\b(recommend|suggest|should|best approach|in summary|ultimately|conclusion|final)\b/i,
+  /\b(the solution|the fix|the answer|the approach|going forward|next steps)\b/i,
+];
+
 // ── Regex patterns ───────────────────────────────────────────────────────────
-const URL_RE      = /https?:\/\/[^\s<>"')\]]+/g;
+const URL_RE        = /https?:\/\/[^\s<>"')\]]+/g;
 const CODE_FENCE_RE = /```(\w*)\n([\s\S]*?)```/g;
 const BACKTICK_RE   = /`([^`\n]{2,60})`/g;
 
@@ -254,6 +270,327 @@ function extractEntities(text) {
   return [...found].sort();
 }
 
+// ── Signal scoring ────────────────────────────────────────────────────────────
+/**
+ * Compute a signal score for a concept across all sessions.
+ *
+ * signalScore = (sessionCount * 2) + (decisionCount * 5) + (codeCount * 3) + (crossProjectCount * 4)
+ *
+ * @param {string}  concept      - The concept string (case-insensitive match)
+ * @param {Array}   sessionItems - Array of { session, extracted } objects
+ * @returns {number}
+ */
+function computeSignalScore(concept, sessionItems) {
+  if (!concept || !Array.isArray(sessionItems)) return 0;
+
+  const conceptLower = concept.toLowerCase();
+  const re = new RegExp(`\\b${escapeRegex(conceptLower)}\\b`, 'i');
+
+  let sessionCount     = 0;
+  let decisionCount    = 0;
+  let codeCount        = 0;
+  const projectSources = new Set();
+
+  for (const item of sessionItems) {
+    if (!item || !item.session || !item.extracted) continue;
+
+    const { session, extracted } = item;
+
+    // Check whether this concept appears in this session's concept list
+    const appearsInSession = (extracted.concepts || []).some(
+      (c) => c.toLowerCase() === conceptLower
+    );
+    if (!appearsInSession) continue;
+
+    sessionCount++;
+
+    // Count decision sentences mentioning this concept
+    for (const d of (extracted.decisions || [])) {
+      if (re.test(d)) decisionCount++;
+    }
+
+    // Count code snippets whose code body mentions this concept
+    for (const snippet of (extracted.snippets || [])) {
+      if (snippet && snippet.code && re.test(snippet.code)) codeCount++;
+    }
+
+    // Track distinct project/workspace sources
+    if (session.source) projectSources.add(session.source);
+    // Also track by workspace path if available (miners may set session.workspacePath)
+    if (session.workspacePath) projectSources.add(session.workspacePath);
+  }
+
+  const crossProjectCount = projectSources.size;
+
+  return (sessionCount * 2) + (decisionCount * 5) + (codeCount * 3) + (crossProjectCount * 4);
+}
+
+// ── Concept decision attribution ──────────────────────────────────────────────
+/**
+ * For a given concept string, scan ALL sessions' extracted decisions for
+ * sentences mentioning that concept. Returns deduplicated decision sentences.
+ *
+ * @param {string} concept      - The concept to match (case-insensitive)
+ * @param {Array}  sessionItems - Array of { session, extracted } objects
+ * @returns {Array<{ sentence: string, sessionTitle: string, sessionDate: string, sessionSlug: string }>}
+ */
+function extractConceptDecisions(concept, sessionItems) {
+  if (!concept || !Array.isArray(sessionItems)) return [];
+
+  const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const results = [];
+  const seen    = new Set();
+
+  for (const item of sessionItems) {
+    if (!item || !item.session || !item.extracted) continue;
+
+    const { session, extracted } = item;
+    const sessionDate = _isoDate(session.timestamp);
+    const sessionSlug = _sessionFileName(session).replace('.md', '');
+
+    for (const decision of (extracted.decisions || [])) {
+      if (!re.test(decision)) continue;
+
+      const key = decision.toLowerCase().replace(/\s+/g, ' ');
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      results.push({
+        sentence:     decision,
+        sessionTitle: session.title || sessionSlug,
+        sessionDate,
+        sessionSlug,
+      });
+    }
+  }
+
+  return results;
+}
+
+// ── Concept excerpts ──────────────────────────────────────────────────────────
+/**
+ * For a given concept, extract the best surrounding context sentences across
+ * all sessions. "Best" = prefer sentences containing decision language,
+ * problem framing, or code context. Returns up to maxExcerpts unique excerpts
+ * with their source session title and date.
+ *
+ * @param {string} concept      - The concept string (case-insensitive match)
+ * @param {Array}  sessionItems - Array of { session, extracted } objects
+ * @param {number} maxExcerpts  - Maximum number of excerpts to return (default: 5)
+ * @returns {Array<{ text: string, sessionTitle: string, sessionDate: string, sessionSlug: string, score: number }>}
+ */
+function extractConceptExcerpts(concept, sessionItems, maxExcerpts = 5) {
+  if (!concept || !Array.isArray(sessionItems)) return [];
+
+  const re       = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const excerpts = [];
+  const seenKeys = new Set();
+
+  for (const item of sessionItems) {
+    if (!item || !item.session || !item.extracted) continue;
+
+    const { session, extracted } = item;
+
+    // Only look in sessions where this concept appears
+    const appearsInSession = (extracted.concepts || []).some(
+      (c) => c.toLowerCase() === concept.toLowerCase()
+    );
+    if (!appearsInSession) continue;
+
+    const sessionDate = _isoDate(session.timestamp);
+    const sessionSlug = _sessionFileName(session).replace('.md', '');
+    const messages    = (session.messages || []);
+
+    for (const msg of messages) {
+      if (!msg || !msg.content) continue;
+
+      // Split into paragraphs, then sentences within each paragraph
+      const paras = msg.content.split(/\n{2,}/);
+
+      for (const para of paras) {
+        if (!re.test(para)) continue;
+
+        // Split paragraph into sentences
+        const sentences = para
+          .replace(/\n/g, ' ')
+          .split(/(?<=[.!?])\s+/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 15);
+
+        // Find sentences containing the concept
+        for (let i = 0; i < sentences.length; i++) {
+          const sentence = sentences[i];
+          if (!re.test(sentence)) continue;
+
+          // Build context window: preceding + current + following sentence
+          const window = [
+            i > 0 ? sentences[i - 1] : null,
+            sentence,
+            i < sentences.length - 1 ? sentences[i + 1] : null,
+          ].filter(Boolean).join(' ').slice(0, 300).trim();
+
+          if (window.length < 20) continue;
+
+          // Dedup by normalised text
+          const key = window.toLowerCase().replace(/\s+/g, ' ');
+          if (seenKeys.has(key)) continue;
+          seenKeys.add(key);
+
+          // Score this excerpt by signal quality
+          let score = 1;
+          for (const pat of EXCERPT_SIGNAL_PATTERNS) {
+            if (pat.test(window)) score += 2;
+          }
+
+          excerpts.push({
+            text:         window,
+            sessionTitle: session.title || sessionSlug,
+            sessionDate,
+            sessionSlug,
+            score,
+          });
+        }
+      }
+    }
+  }
+
+  // Sort by score desc, then trim to maxExcerpts
+  return excerpts
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxExcerpts);
+}
+
+// ── Session narrative ─────────────────────────────────────────────────────────
+/**
+ * Produce a 2-3 sentence narrative summary for a session:
+ * - Opening: core problem/topic from the first 1-2 human messages (~150 chars)
+ * - Approach: decision sentences, or a summary of top concepts
+ * - Outcome: last assistant message excerpt containing conclusion language
+ *
+ * Falls back gracefully if content is sparse.
+ *
+ * @param {Object} session   - Normalised session object (has .messages, .title)
+ * @param {Object} extracted - Extracted data for this session
+ * @returns {string}
+ */
+function extractSessionNarrative(session, extracted) {
+  if (!session || !session.messages || session.messages.length === 0) {
+    return (session && session.title) ? `Session: ${session.title}.` : '';
+  }
+
+  const messages = session.messages;
+
+  // ── Opening: derive core problem/topic from first human message(s) ────────
+  let opening = '';
+  const humanMessages = messages.filter(
+    (m) => m && (m.role === 'human' || m.role === 'user')
+  );
+
+  if (humanMessages.length > 0) {
+    const firstHuman = humanMessages[0].content || '';
+    // Take the first meaningful line/sentence
+    const firstLine = firstHuman
+      .replace(/\n+/g, ' ')
+      .trim()
+      .split(/[.!?]\s+/)[0]
+      .slice(0, 150)
+      .trim();
+
+    if (firstLine.length > 10) {
+      opening = firstLine.endsWith('.')
+        ? firstLine
+        : firstLine + '.';
+    }
+  }
+
+  if (!opening && session.title) {
+    opening = `Topic: ${session.title}.`;
+  }
+
+  // ── Approach: decision sentences, or top concept names ────────────────────
+  let approach = '';
+  const decisions = extracted && extracted.decisions ? extracted.decisions : [];
+
+  if (decisions.length > 0) {
+    // Take the most informative decision (longest one up to 200 chars)
+    const best = decisions
+      .slice()
+      .sort((a, b) => b.length - a.length)
+      .find((d) => d.length <= 200);
+
+    if (best) {
+      approach = best.endsWith('.') ? best : best + '.';
+    }
+  }
+
+  if (!approach) {
+    // Fall back to listing top concepts
+    const concepts = extracted && extracted.concepts ? extracted.concepts : [];
+    if (concepts.length > 0) {
+      const top = concepts.slice(0, 4).join(', ');
+      approach = `Covered: ${top}.`;
+    }
+  }
+
+  // ── Outcome: last assistant message with conclusion language ──────────────
+  let outcome = '';
+  const assistantMessages = messages.filter(
+    (m) => m && (m.role === 'assistant' || m.role === 'bot')
+  );
+
+  // Search assistant messages in reverse for conclusion language
+  for (let i = assistantMessages.length - 1; i >= 0; i--) {
+    const content = (assistantMessages[i].content || '').replace(/\n/g, ' ');
+
+    // Split into sentences and find the one with conclusion language
+    const sentences = content
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 15);
+
+    for (const sentence of sentences) {
+      if (CONCLUSION_PATTERNS.some((re) => re.test(sentence))) {
+        outcome = sentence.slice(0, 200).trim();
+        if (!outcome.endsWith('.')) outcome += '.';
+        break;
+      }
+    }
+
+    if (outcome) break;
+  }
+
+  // ── Assemble ───────────────────────────────────────────────────────────────
+  const parts = [opening, approach, outcome].filter(Boolean);
+
+  // Avoid returning an empty string — fall back to title
+  if (parts.length === 0) {
+    return session.title ? `Session: ${session.title}.` : '';
+  }
+
+  return parts.join(' ');
+}
+
+// ── Private helpers (used internally — not re-exported from obsidian.js) ─────
+
+function _isoDate(d) {
+  if (!d) return '';
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt.getTime())) return '';
+  return dt.toISOString().slice(0, 10);
+}
+
+function _sessionFileName(session) {
+  if (!session) return 'unknown.md';
+  const date  = _isoDate(session.timestamp);
+  const title = (session.title || 'untitled')
+    .replace(/[^a-zA-Z0-9 ]+/g, ' ')
+    .replace(/\s+/g, '-')
+    .toLowerCase()
+    .slice(0, 50)
+    .replace(/-+$/, '');
+  return `${session.source || 'unknown'}-${date}-${title}.md`;
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function dedupStrings(arr) {
   const seen = new Set();
@@ -269,4 +606,10 @@ function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-module.exports = { extract };
+module.exports = {
+  extract,
+  computeSignalScore,
+  extractConceptDecisions,
+  extractConceptExcerpts,
+  extractSessionNarrative,
+};

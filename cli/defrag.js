@@ -7,15 +7,16 @@
  *   node cli/defrag.js [options]
  *
  * Options:
- *   --output <dir>     Output vault directory (default: ./vault)
- *   --sources <list>   Comma-separated: claude,codex,cursor (default: all)
- *   --dry-run          Show what would be extracted without writing
- *   --verbose          Show detailed progress
- *   --since <date>     Only process conversations after this date (ISO 8601)
- *   --watch            Re-run whenever source files change (2 s debounce)
- *   --model <name>     LLM model hint stored in defrag.json (informational)
- *   --gpt-ko           Print QMD integration instructions after writing vault
- *   --help             Show this message
+ *   --output <dir>        Output vault directory (default: ./vault)
+ *   --sources <list>      Comma-separated: claude,codex,cursor (default: all)
+ *   --dry-run             Show what would be extracted without writing
+ *   --verbose             Show detailed progress
+ *   --since <date>        Only process conversations after this date (ISO 8601)
+ *   --watch               Re-run whenever source files change (2 s debounce)
+ *   --model <name>        LLM model hint stored in defrag.json (informational)
+ *   --gpt-ko              Print QMD integration instructions after writing vault
+ *   --min-signal <number> Minimum signal score for standalone concept notes (default: 8)
+ *   --help                Show this message
  */
 
 'use strict';
@@ -33,9 +34,10 @@ const { write }    = require('./writers/obsidian');
 const { link }     = require('./writers/linker');
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const VERSION       = '1.0';
-const ALL_SOURCES   = ['claude', 'codex', 'cursor'];
-const DEFAULT_OUT   = './vault';
+const VERSION              = '1.0';
+const ALL_SOURCES          = ['claude', 'codex', 'cursor'];
+const DEFAULT_OUT          = './vault';
+const DEFAULT_MIN_SIGNAL   = 8;
 
 const MINER_MAP = {
   claude: claudeMiner,
@@ -177,6 +179,9 @@ async function runPipeline(opts) {
   // ── Phase 4: Write vault ────────────────────────────────────────────────
   if (!opts.dryRun) {
     print(`Writing vault to ${opts.output}...`);
+    if (opts.minSignal !== DEFAULT_MIN_SIGNAL) {
+      print(`  Signal threshold: ${opts.minSignal} (default: ${DEFAULT_MIN_SIGNAL})`);
+    }
   } else {
     print('Dry run — no files will be written');
   }
@@ -184,10 +189,11 @@ async function runPipeline(opts) {
   let writeStats = { written: 0, skipped: 0 };
   try {
     writeStats = write({
-      outputDir: opts.output,
-      sessions:  enriched,
-      dryRun:    opts.dryRun,
-      verbose:   opts.verbose,
+      outputDir:       opts.output,
+      sessions:        enriched,
+      dryRun:          opts.dryRun,
+      verbose:         opts.verbose,
+      signalThreshold: opts.minSignal,
     });
   } catch (err) {
     die(`Write error: ${err.message}`);
@@ -230,9 +236,9 @@ async function runPipeline(opts) {
     .map(([c]) => titleCase(c));
 
   const manifest = {
-    version:     '1.0',
-    generated:   new Date().toISOString(),
-    sources:     scanResults,
+    version:         '1.0',
+    generated:       new Date().toISOString(),
+    sources:         scanResults,
     stats: {
       sessions:     dedupedSessions.length,
       concepts:     totalConcepts,
@@ -241,8 +247,9 @@ async function runPipeline(opts) {
       links:        linkStats.linksCreated,
       filesWritten: writeStats.written,
     },
-    topConcepts: topConceptsList,
-    vault:       opts.output,
+    topConcepts:     topConceptsList,
+    vault:           opts.output,
+    signalThreshold: opts.minSignal,
     ...(opts.model ? { model: opts.model } : {}),
   };
 
@@ -269,6 +276,7 @@ async function runPipeline(opts) {
   if (writeStats.skipped > 0) {
     printStat('Files unchanged',  writeStats.skipped);
   }
+  printStat('Signal threshold',   opts.minSignal);
   printStat('Output',             opts.output);
 
   // ── Phase 7: QMD integration ────────────────────────────────────────────
@@ -397,15 +405,16 @@ function setupWatchMode(opts) {
 // ── Argument parser ──────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const opts = {
-    output:  DEFAULT_OUT,
-    sources: [...ALL_SOURCES],
-    dryRun:  false,
-    verbose: false,
-    since:   null,
-    watch:   false,
-    model:   null,
-    gptKo:   false,
-    help:    false,
+    output:    DEFAULT_OUT,
+    sources:   [...ALL_SOURCES],
+    dryRun:    false,
+    verbose:   false,
+    since:     null,
+    watch:     false,
+    model:     null,
+    gptKo:     false,
+    help:      false,
+    minSignal: DEFAULT_MIN_SIGNAL,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -457,6 +466,16 @@ function parseArgs(argv) {
       case '--gptko':
         opts.gptKo = true;
         break;
+
+      case '--min-signal': {
+        const raw = argv[++i];
+        const n   = Number(raw);
+        if (!isFinite(n) || n < 0) {
+          die(`--min-signal must be a non-negative number (got: "${raw}")`);
+        }
+        opts.minSignal = n;
+        break;
+      }
 
       case '--help':
       case '-h':
@@ -524,15 +543,18 @@ USAGE
   node cli/defrag.js [options]
 
 OPTIONS
-  --output <dir>     Output vault directory (default: ${DEFAULT_OUT})
-  --sources <list>   Comma-separated: ${ALL_SOURCES.join(',')} (default: all)
-  --dry-run          Show what would be extracted without writing files
-  --verbose          Show detailed progress
-  --since <date>     Only process conversations after this date (e.g. 2025-01-01)
-  --watch            Re-run automatically when source files change (2 s debounce)
-  --model <name>     Store a model hint in defrag.json (informational)
-  --gpt-ko           Print QMD indexing instructions; auto-run if qmd is in PATH
-  --help             Show this help message
+  --output <dir>        Output vault directory (default: ${DEFAULT_OUT})
+  --sources <list>      Comma-separated: ${ALL_SOURCES.join(',')} (default: all)
+  --dry-run             Show what would be extracted without writing files
+  --verbose             Show detailed progress
+  --since <date>        Only process conversations after this date (e.g. 2025-01-01)
+  --watch               Re-run automatically when source files change (2 s debounce)
+  --model <name>        Store a model hint in defrag.json (informational)
+  --gpt-ko              Print QMD indexing instructions; auto-run if qmd is in PATH
+  --min-signal <number> Minimum signal score for a standalone concept note (default: ${DEFAULT_MIN_SIGNAL})
+                        Concepts below threshold are listed in _low-signal.md instead.
+                        Score = (sessions×2) + (decisions×5) + (code×3) + (cross-project×4)
+  --help                Show this help message
 
 EXAMPLES
   npx context-defrag
@@ -541,11 +563,22 @@ EXAMPLES
   npx context-defrag --dry-run --verbose
   npx context-defrag --watch --output ~/my-vault
   npx context-defrag --gpt-ko
+  npx context-defrag --min-signal 12
+  npx context-defrag --min-signal 0     # every concept gets its own note
 
 SOURCES
   claude   ~/.claude/projects/  (JSONL conversation files — Desktop & Code)
   codex    ~/.codex/            (OpenAI Codex CLI history)
   cursor   ~/Library/Application Support/Cursor/  (SQLite chat history)
+
+SIGNAL SCORING
+  Each concept earns signal points based on how it appears across sessions:
+    sessions   ×2  — number of sessions the concept appeared in
+    decisions  ×5  — decision sentences that explicitly mention it
+    code       ×3  — code snippets whose body references it
+    projects   ×4  — distinct workspace/source paths where it appeared
+
+  Concepts scoring below --min-signal are collected in vault/_low-signal.md.
 
 OUTPUT
   After each run, <vault>/defrag.json is written with session counts, top

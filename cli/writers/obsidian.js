@@ -5,7 +5,8 @@
  *   vault/
  *     _index.md           — root Map of Content
  *     _timeline.md        — chronological session list
- *     concepts/           — one note per concept
+ *     _low-signal.md      — terms below the signal threshold (alphabetical index)
+ *     concepts/           — one note per concept (signal >= threshold)
  *     sessions/           — one note per source session
  *     code/               — extracted code snippets
  *     links.md            — all URLs grouped by domain
@@ -16,17 +17,31 @@
 const fs   = require('fs');
 const path = require('path');
 
+const {
+  computeSignalScore,
+  extractConceptDecisions,
+  extractConceptExcerpts,
+  extractSessionNarrative,
+} = require('../extractor');
+
+// ── Defaults ──────────────────────────────────────────────────────────────────
+const DEFAULT_SIGNAL_THRESHOLD = 8;
+
 // ── Main write function ──────────────────────────────────────────────────────
 /**
  * @param {Object}  opts
- * @param {string}  opts.outputDir     - Root vault directory
- * @param {Array}   opts.sessions      - Array of { session, extracted } objects
- * @param {boolean} opts.dryRun        - If true, log what would be written
+ * @param {string}  opts.outputDir        - Root vault directory
+ * @param {Array}   opts.sessions         - Array of { session, extracted } objects
+ * @param {boolean} opts.dryRun           - If true, log what would be written
  * @param {boolean} opts.verbose
+ * @param {number}  [opts.signalThreshold] - Minimum signal score for a standalone concept note (default: 8)
  * @returns {{ written: number, skipped: number }}
  */
-function write({ outputDir, sessions, dryRun, verbose }) {
-  const stats = { written: 0, skipped: 0 };
+function write({ outputDir, sessions, dryRun, verbose, signalThreshold }) {
+  const stats     = { written: 0, skipped: 0 };
+  const threshold = (typeof signalThreshold === 'number' && isFinite(signalThreshold))
+    ? signalThreshold
+    : DEFAULT_SIGNAL_THRESHOLD;
 
   if (!dryRun) {
     ensureDir(outputDir);
@@ -43,18 +58,31 @@ function write({ outputDir, sessions, dryRun, verbose }) {
     writeNote(filePath, content, { dryRun, verbose, stats });
   }
 
-  // ── 2. Concept notes ─────────────────────────────────────────────────────
+  // ── 2. Concept notes (tiered) ─────────────────────────────────────────────
   // Build concept → sessions map
   const conceptMap = buildConceptMap(sessions);
 
+  // Separate concepts into high-signal (standalone notes) and low-signal (index)
+  const lowSignalConcepts = [];  // { concept, sessionCount }
+
   for (const [concept, mentionedIn] of conceptMap.entries()) {
-    const fileName = slugify(concept) + '.md';
-    const filePath = path.join(outputDir, 'concepts', fileName);
-    const content  = renderConceptNote(concept, mentionedIn, sessions);
-    writeNote(filePath, content, { dryRun, verbose, stats });
+    const score = computeSignalScore(concept, sessions);
+
+    if (score >= threshold) {
+      const fileName = slugify(concept) + '.md';
+      const filePath = path.join(outputDir, 'concepts', fileName);
+      const content  = renderConceptNote(concept, mentionedIn, sessions, score);
+      writeNote(filePath, content, { dryRun, verbose, stats });
+    } else {
+      lowSignalConcepts.push({ concept, sessionCount: mentionedIn.length });
+    }
   }
 
-  // ── 3. Code snippet notes ────────────────────────────────────────────────
+  // ── 3. _low-signal.md ────────────────────────────────────────────────────
+  const lowSignalContent = renderLowSignalNote(lowSignalConcepts);
+  writeNote(path.join(outputDir, '_low-signal.md'), lowSignalContent, { dryRun, verbose, stats });
+
+  // ── 4. Code snippet notes ────────────────────────────────────────────────
   let snippetIndex = 1;
   for (const { session, extracted } of sessions) {
     for (const snippet of extracted.snippets) {
@@ -67,18 +95,18 @@ function write({ outputDir, sessions, dryRun, verbose }) {
     }
   }
 
-  // ── 4. Links index ───────────────────────────────────────────────────────
+  // ── 5. Links index ───────────────────────────────────────────────────────
   const allUrls = sessions.flatMap(({ session, extracted }) =>
     extracted.urls.map((url) => ({ url, session }))
   );
   const linksContent = renderLinksNote(allUrls);
   writeNote(path.join(outputDir, 'links.md'), linksContent, { dryRun, verbose, stats });
 
-  // ── 5. Timeline ──────────────────────────────────────────────────────────
+  // ── 6. Timeline ──────────────────────────────────────────────────────────
   const timelineContent = renderTimeline(sessions);
   writeNote(path.join(outputDir, '_timeline.md'), timelineContent, { dryRun, verbose, stats });
 
-  // ── 6. Root index ────────────────────────────────────────────────────────
+  // ── 7. Root index ────────────────────────────────────────────────────────
   const indexContent = renderIndex(sessions, conceptMap);
   writeNote(path.join(outputDir, '_index.md'), indexContent, { dryRun, verbose, stats });
 
@@ -87,40 +115,68 @@ function write({ outputDir, sessions, dryRun, verbose }) {
 
 // ── Note renderers ────────────────────────────────────────────────────────────
 
+/**
+ * Render an upgraded session note with a narrative Summary section.
+ */
 function renderSessionNote(session, extracted) {
   const date      = isoDate(session.timestamp);
   const isoFull   = session.timestamp.toISOString();
   const sourceTag = session.source;
   const sessionId = sessionFileName(session).replace('.md', '');
 
-  const topicLinks = extracted.concepts.slice(0, 10).map((c) =>
-    `- [[concepts/${slugify(c)}|${c}]]`
-  ).join('\n') || '_None extracted_';
+  // ── Summary narrative ───────────────────────────────────────────────────
+  const narrative = extractSessionNarrative(session, extracted);
+  const summarySection = narrative
+    ? `## Summary\n${narrative}\n`
+    : '';
 
+  // ── Key Decisions ───────────────────────────────────────────────────────
   const decisionsSection = extracted.decisions.length
     ? extracted.decisions.map((d) => `- ${d}`).join('\n')
     : '_None detected_';
 
-  const snippetLinks = extracted.snippets.map((_, i) => {
-    // We need the global snippet index, but we only have the local one here.
-    // Use the session id as a prefix for readability.
-    const label = extracted.snippets[i].lang || 'code';
-    return `- [[code/snippet-TBD]] — ${label} snippet`;
-  }).join('\n') || '_None_';
+  // ── Top Concepts — inline pill style ────────────────────────────────────
+  const topConceptLinks = extracted.concepts.slice(0, 12).map((c) =>
+    `[[concepts/${slugify(c)}|${c}]]`
+  ).join(' · ') || '_None extracted_';
 
+  // ── Code snippets ────────────────────────────────────────────────────────
+  // Note: global snippet indices are assigned in the write() loop; here we
+  // emit per-session local indices annotated with lang + a label heuristic.
+  const snippetLinks = extracted.snippets.length
+    ? extracted.snippets.map((s, i) => {
+        const paddedIdx = String(i + 1).padStart(3, '0');
+        const label     = deriveSnippetLabel(s.code);
+        return `- [[code/snippet-${paddedIdx}]] — ${s.lang || 'text'}${label ? ` — ${label}` : ''}`;
+      }).join('\n')
+    : '_None_';
+
+  // ── URLs ─────────────────────────────────────────────────────────────────
   const urlSection = extracted.urls.length
     ? extracted.urls.slice(0, 20).map((u) => `- ${u}`).join('\n')
     : '_None_';
 
+  // ── Technologies Mentioned ────────────────────────────────────────────────
   const entitySection = extracted.entities.length
     ? extracted.entities.slice(0, 15).join(', ')
     : '_None detected_';
+
+  // ── Signal score for this session (sum of its concepts' individual scores)
+  const sessionSignal = extracted.concepts.reduce((sum, c) => {
+    // Lightweight per-concept score using just this session
+    const re = new RegExp(`\\b${escapeRegex(c)}\\b`, 'i');
+    const decisions = extracted.decisions.filter((d) => re.test(d)).length;
+    const code      = extracted.snippets.filter((s) => s.code && re.test(s.code)).length;
+    return sum + decisions * 5 + code * 3;
+  }, extracted.concepts.length * 2);
 
   return `---
 title: "${escYaml(session.title)}"
 source: ${sourceTag}
 date: ${isoFull}
 turns: ${session.turnCount}
+signal: ${sessionSignal}
+concepts: ${extracted.concepts.length}
 tags: [session, ${sourceTag}]
 ---
 
@@ -128,72 +184,194 @@ tags: [session, ${sourceTag}]
 
 > Source: **${sourceTag}** | ${date} | ${session.turnCount} turns
 
-## Key Topics
-${topicLinks}
-
-## Decisions
+${summarySection}
+## Key Decisions
 ${decisionsSection}
+
+## Top Concepts
+${topConceptLinks}
 
 ## Code Snippets
 ${snippetLinks}
 
-## URLs
+## URLs Referenced
 ${urlSection}
 
 ## Technologies Mentioned
 ${entitySection}
+
+<!-- defrag:end -->
 `;
 }
 
-function renderConceptNote(concept, mentionedIn, allSessions) {
-  // Find sessions where this concept appears
-  const sessionLinks = mentionedIn.map((sessionId) => {
-    const entry = allSessions.find(
-      ({ session }) => session.id === sessionId
-    );
-    if (!entry) return null;
-    const slug = sessionFileName(entry.session).replace('.md', '');
-    return `- [[sessions/${slug}|${entry.session.title}]]`;
-  }).filter(Boolean).join('\n');
+/**
+ * Render an upgraded concept note with signal score, Key Decisions,
+ * Context & Excerpts, Code Context, and sorted session list.
+ */
+function renderConceptNote(concept, mentionedIn, allSessions, signalScore) {
+  const score = (typeof signalScore === 'number') ? signalScore : 0;
 
-  // Find related concepts (concepts that co-appear in the same sessions)
+  // ── Gather sessions in scope ──────────────────────────────────────────────
+  const sessionEntries = mentionedIn
+    .map((sessionId) => allSessions.find(({ session }) => session.id === sessionId))
+    .filter(Boolean)
+    .sort((a, b) => b.session.timestamp - a.session.timestamp); // most recent first
+
+  const firstEntry = sessionEntries[sessionEntries.length - 1]; // oldest
+  const lastEntry  = sessionEntries[0];                         // newest
+
+  const firstDate  = firstEntry ? isoDate(firstEntry.session.timestamp) : '';
+  const lastDate   = lastEntry  ? isoDate(lastEntry.session.timestamp)  : '';
+
+  // Source tags — unique sources across all mentioning sessions
+  const sources = [...new Set(sessionEntries.map(({ session }) => session.source))];
+
+  const displayName = titleCase(concept);
+
+  // ── YAML frontmatter ─────────────────────────────────────────────────────
+  const tagList = ['concept', ...sources].join(', ');
+
+  // ── Key Decisions ─────────────────────────────────────────────────────────
+  const conceptDecisions = extractConceptDecisions(concept, allSessions);
+  let decisionsSection = '';
+  if (conceptDecisions.length > 0) {
+    decisionsSection = conceptDecisions
+      .slice(0, 10)
+      .map((d) => {
+        const dateStr = d.sessionDate ? ` (${d.sessionDate},` : ' (';
+        return `- ${d.sentence}${dateStr} [[sessions/${d.sessionSlug}]])`;
+      })
+      .join('\n');
+  }
+
+  // ── Context & Excerpts ────────────────────────────────────────────────────
+  const excerpts = extractConceptExcerpts(concept, allSessions, 5);
+  let excerptsSection = '';
+  if (excerpts.length > 0) {
+    excerptsSection = excerpts
+      .map((e) =>
+        `> "${e.text}"\n> — [[sessions/${e.sessionSlug}|${escYaml(e.sessionTitle)}]], ${e.sessionDate}`
+      )
+      .join('\n\n');
+  }
+
+  // ── Code Context — snippets whose code body mentions this concept ─────────
+  const codeEntries = [];
+  for (const { session, extracted } of allSessions) {
+    if (!mentionedIn.includes(session.id)) continue;
+    const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+    for (const snippet of (extracted.snippets || [])) {
+      if (snippet && snippet.code && re.test(snippet.code)) {
+        const paddedIdx = String(snippet.index + 1).padStart(3, '0');
+        const label     = deriveSnippetLabel(snippet.code);
+        codeEntries.push(`- [[code/snippet-${paddedIdx}]] — ${snippet.lang || 'text'}${label ? ` — ${label}` : ''}`);
+      }
+    }
+  }
+  let codeSection = '';
+  if (codeEntries.length > 0) {
+    codeSection = codeEntries.slice(0, 10).join('\n');
+  }
+
+  // ── Related concepts ─────────────────────────────────────────────────────
   const related = findRelatedConcepts(concept, mentionedIn, allSessions);
   const relatedLinks = related.slice(0, 8).map((c) =>
     `- [[concepts/${slugify(c)}|${c}]]`
   ).join('\n') || '_None_';
 
-  // Build a context summary from the first session
-  const firstEntry = allSessions.find(
-    ({ session }) => mentionedIn.includes(session.id)
-  );
-  const contextSummary = firstEntry
-    ? buildContextSummary(concept, firstEntry.session.messages)
-    : '';
+  // ── Sessions list (most recent first, capped at 20) ───────────────────────
+  const sessionLines = sessionEntries
+    .slice(0, 20)
+    .map(({ session }) => {
+      const slug = sessionFileName(session).replace('.md', '');
+      const date = isoDate(session.timestamp);
+      return `- [[sessions/${slug}|${escYaml(session.title)}]] — ${date}`;
+    })
+    .join('\n') || '_No sessions found_';
 
-  const firstSource = firstEntry ? firstEntry.session.source : 'unknown';
-  const firstDate   = firstEntry ? isoDate(firstEntry.session.timestamp) : '';
+  // ── Assemble note ─────────────────────────────────────────────────────────
+  const parts = [];
 
-  const displayName = titleCase(concept);
-
-  return `---
+  parts.push(`---
 title: "${escYaml(displayName)}"
-tags: [concept, ${firstSource}]
-source: ${firstSource}
-date: ${firstDate}
+tags: [${tagList}]
+signal: ${score}
+sessions: ${mentionedIn.length}
+decisions: ${conceptDecisions.length}
+${firstDate ? `first-seen: ${firstDate}` : ''}
+${lastDate  ? `last-seen: ${lastDate}`   : ''}
 ---
 
 # ${displayName}
+`);
 
-> Extracted from: [[sessions/${firstEntry ? sessionFileName(firstEntry.session).replace('.md', '') : 'unknown'}|${firstEntry ? firstEntry.session.title : 'unknown'}]]
+  if (decisionsSection) {
+    parts.push(`## Key Decisions\n${decisionsSection}\n`);
+  }
 
-## Context
-${contextSummary || `_${displayName} was mentioned across ${mentionedIn.length} session(s)._`}
+  if (excerptsSection) {
+    parts.push(`## Context & Excerpts\n${excerptsSection}\n`);
+  }
 
-## Related
-${relatedLinks}
+  if (codeSection) {
+    parts.push(`## Code Context\nLinks to code snippets where this concept appears:\n${codeSection}\n`);
+  }
 
-## Mentions
-${sessionLinks || '_No sessions found_'}
+  parts.push(`## Sessions (${mentionedIn.length})\n${sessionLines}\n`);
+
+  parts.push(`## Related\n${relatedLinks}\n`);
+
+  parts.push('<!-- defrag:end -->\n');
+
+  return parts.join('\n');
+}
+
+/**
+ * Render the _low-signal.md terms index.
+ * Groups terms alphabetically; each entry shows mention count.
+ */
+function renderLowSignalNote(lowSignalConcepts) {
+  // Sort alphabetically by concept name
+  const sorted = [...lowSignalConcepts].sort((a, b) =>
+    a.concept.localeCompare(b.concept)
+  );
+
+  // Group by first letter
+  const byLetter = new Map();
+  for (const { concept, sessionCount } of sorted) {
+    const letter = concept.charAt(0).toUpperCase();
+    const key    = /^[A-Z]$/.test(letter) ? letter : '#';
+    if (!byLetter.has(key)) byLetter.set(key, []);
+    byLetter.get(key).push({ concept, sessionCount });
+  }
+
+  // Sort letter keys; '#' goes at the end
+  const sortedKeys = [...byLetter.keys()].sort((a, b) => {
+    if (a === '#') return 1;
+    if (b === '#') return -1;
+    return a.localeCompare(b);
+  });
+
+  const sections = sortedKeys.map((letter) => {
+    const items = byLetter.get(letter).map(({ concept, sessionCount }) =>
+      `- ${concept} (${sessionCount} mention${sessionCount !== 1 ? 's' : ''})`
+    ).join('\n');
+    return `## ${letter}\n${items}`;
+  }).join('\n\n');
+
+  return `---
+title: "Low-Signal Terms"
+tags: [index, low-signal]
+---
+
+# Low-Signal Terms
+
+Terms that appeared but didn't meet the signal threshold for standalone notes.
+These are still indexed — use QMD to search for them.
+
+${sections || '_No low-signal terms_'}
+
+<!-- defrag:end -->
 `;
 }
 
@@ -341,6 +519,7 @@ Generated by [context-defrag](https://github.com/you/context-defrag) on ${new Da
 ## Navigation
 
 - [[_timeline]] — Chronological session list
+- [[_low-signal]] — Low-signal terms index
 - [[links]] — All URLs grouped by domain
 - [concepts/](concepts/) — All extracted concepts
 - [sessions/](sessions/) — All session notes
@@ -398,6 +577,7 @@ function findRelatedConcepts(concept, mentionedIn, allSessions) {
 /**
  * Builds a 2-3 sentence context summary by finding the first paragraph
  * in any message that mentions the concept.
+ * Retained for backward compatibility; new code uses extractConceptExcerpts.
  */
 function buildContextSummary(concept, messages) {
   const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
@@ -423,6 +603,38 @@ function buildContextSummary(concept, messages) {
   return '';
 }
 
+// ── Snippet label heuristic ───────────────────────────────────────────────────
+/**
+ * Try to derive a short descriptive label from the first meaningful line
+ * of a code snippet (e.g. function/class name, comment, etc.).
+ * Returns an empty string if nothing useful can be extracted.
+ */
+function deriveSnippetLabel(code) {
+  if (!code) return '';
+
+  const lines = code.split('\n').map((l) => l.trim()).filter(Boolean);
+
+  for (const line of lines.slice(0, 5)) {
+    // Skip blank or trivially short lines
+    if (line.length < 3) continue;
+
+    // Extract comment content (// ... or # ...)
+    const commentMatch = line.match(/^(?:\/\/|#)\s*(.{4,60})/);
+    if (commentMatch) return commentMatch[1].trim().slice(0, 50);
+
+    // Extract function/class/def name
+    const fnMatch = line.match(
+      /^(?:(?:export\s+)?(?:async\s+)?function\s+(\w+)|class\s+(\w+)|def\s+(\w+)|const\s+(\w+)\s*=)/
+    );
+    if (fnMatch) {
+      const name = fnMatch[1] || fnMatch[2] || fnMatch[3] || fnMatch[4];
+      if (name) return name;
+    }
+  }
+
+  return '';
+}
+
 // ── File system utilities ────────────────────────────────────────────────────
 
 function writeNote(filePath, content, { dryRun, verbose, stats }) {
@@ -435,6 +647,29 @@ function writeNote(filePath, content, { dryRun, verbose, stats }) {
   // Idempotent: only write if content changed
   if (fs.existsSync(filePath)) {
     const existing = fs.readFileSync(filePath, 'utf8');
+
+    // Preserve anything the user wrote after <!-- defrag:end -->
+    const SENTINEL = '<!-- defrag:end -->';
+    const existingEnd = existing.indexOf(SENTINEL);
+    const newEnd      = content.indexOf(SENTINEL);
+
+    if (existingEnd !== -1 && newEnd !== -1) {
+      const existingTail = existing.slice(existingEnd + SENTINEL.length);
+      const newHead      = content.slice(0, newEnd + SENTINEL.length);
+      const merged       = newHead + existingTail;
+
+      if (merged === existing) {
+        stats.skipped++;
+        return;
+      }
+
+      fs.writeFileSync(filePath, merged, 'utf8');
+      stats.written++;
+      if (verbose) console.log(`  [WRITE] ${filePath}`);
+      return;
+    }
+
+    // No sentinel — fall back to exact-match idempotency
     if (existing === content) {
       stats.skipped++;
       return;
@@ -507,4 +742,12 @@ function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-module.exports = { write, sessionFileName, slugify, buildConceptMap };
+module.exports = {
+  write,
+  sessionFileName,
+  slugify,
+  buildConceptMap,
+  renderConceptNote,
+  renderSessionNote,
+  renderLowSignalNote,
+};
