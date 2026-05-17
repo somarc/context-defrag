@@ -184,10 +184,70 @@ const _logBuffer   = [];   // newest at end
 let   _lastLogTime = Date.now();
 
 function logPush(entry) {
-  // entry: { type, text, time }
+  const { type, text } = entry;
+
+  // Parse structured pipeline updates from log messages
+  // This lets defrag.js drive the pipeline panel via tui.log() without a separate API
+  if (type === 'SCAN' && text.includes('Found')) {
+    _state.pipeline.scan.status = 'done';
+    _state.pipeline.scan.detail = text.replace(/\[SCAN\]\s*/, '').slice(0, 20);
+  }
+  if (type === 'EPISODE') {
+    if (text.match(/\d+ sessions → \d+ episodes/)) {
+      const m = text.match(/(\d+) sessions → (\d+) episodes/);
+      if (m) {
+        _state.episodes = parseInt(m[2]);
+        _state.pipeline.group.status = 'done';
+        _state.pipeline.group.detail = `${m[2]} eps`;
+      }
+    }
+  }
+  if (type === 'FILTER') {
+    const mCursor = text.match(/Skipped (\d+) Cursor/);
+    if (mCursor) _state.filterCursor = parseInt(mCursor[1]);
+    const mCodex = text.match(/Skipped (\d+) Codex/i);
+    if (mCodex) _state.filterCodex = parseInt(mCodex[1]);
+  }
+  if (type === 'EXTRACT') {
+    if (text.includes('Signal index built')) {
+      _state.pipeline.extract.status = 'done';
+      _state.pipeline.index.status = 'done';
+      const m = text.match(/(\d+) concepts/);
+      if (m) _state.pipeline.index.detail = `${m[1]}c`;
+    }
+  }
+  if (type === 'PERF') {
+    const mExtract = text.match(/EXTRACT: (\d+)ms wall\s+cpu (\d+)ms/);
+    if (mExtract) {
+      _state.pipeline.extract.wallMs = parseInt(mExtract[1]);
+      _state.pipeline.extract.cpuMs  = parseInt(mExtract[2]);
+    }
+    const mWrite = text.match(/WRITE: (\d+)ms/);
+    if (mWrite) {
+      _state.pipeline.write.status = 'done';
+      _state.pipeline.write.detail = `${(parseInt(mWrite[1])/1000).toFixed(1)}s`;
+    }
+    const mLink = text.match(/LINK: (\d+)ms/);
+    if (mLink) {
+      _state.pipeline.link.status = 'done';
+      _state.pipeline.link.detail = `${(parseInt(mLink[1])/1000).toFixed(1)}s`;
+    }
+  }
+  if (type === 'WARN') {
+    if (text.includes('Weak extraction')) _state.warnWeak++;
+    if (text.includes('micro-session') || text.includes('skipped')) _state.warnSkipped++;
+  }
+
+  // Suppress per-file WRITE entries from activity log — they flood the panel
+  // Milestone WRITE lines (e.g. "Vault written", "Fresh vault", "Re-run detected") pass through
+  if (type === 'WRITE') {
+    const isFileLine = /^sessions\/|^concepts\/|^code\/|^links\.md|^_/.test(text);
+    if (isFileLine) return; // update pipeline state only, no log entry
+  }
+
   _logBuffer.push(entry);
   _lastLogTime = Date.now();
-  if (_logBuffer.length > 40) _logBuffer.shift();
+  if (_logBuffer.length > 60) _logBuffer.shift();
 }
 
 // Heartbeat: synthetic pulse line injected when no activity for >4s (Bug 3: was 2.5s)
@@ -212,10 +272,10 @@ const _state = {
   links:      0,
   files:      0,
   sources:    {},          // { claude: 'found'|'missing'|'scanning', ... }
-  startTime:  0,          // Bug 5: set in init(), not at module load time
+  startTime:  0,
   lastUpdate: Date.now(),
   done:       false,
-  currentSession: '',    // e.g. "[42/544] codex 2026-05-14" — shown during extraction
+  currentSession: '',
   currentStage:   '',
   currentDetail:  '',
   currentFocus:   '',
@@ -224,9 +284,32 @@ const _state = {
   tiersHigh:     0,
   tiersMedium:   0,
   tiersLow:      0,
-  promoted:      0,       // concepts that got standalone notes
-  lowSignal:     0,       // concepts in _low-signal.md
-  topConcepts:   [],      // top 5 promoted concept names for completion screen
+  promoted:      0,
+  lowSignal:     0,
+  topConcepts:   [],
+  // Episode tracking
+  episodes:       0,
+  episodeList:    [],   // [{ title, workspace, sessionCount }] — top episodes
+  // Per-stage pipeline tracking (for left panel)
+  pipeline: {
+    scan:     { status: 'pending', detail: '' },
+    group:    { status: 'pending', detail: '' },
+    extract:  { status: 'pending', detail: '', wallMs: 0, cpuMs: 0 },
+    index:    { status: 'pending', detail: '' },
+    write:    { status: 'pending', detail: '', sessionsTotal: 0, sessionsDone: 0 },
+    concepts: { status: 'pending', detail: '', total: 0, done: 0 },
+    link:     { status: 'pending', detail: '' },
+  },
+  // Write-phase counters
+  writeSessions: 0,
+  writeConcepts: 0,
+  writeCode:     0,
+  writeSkipped:  0,
+  // Warn/filter counters
+  warnWeak:      0,
+  warnSkipped:   0,
+  filterCursor:  0,
+  filterCodex:   0,
 };
 
 // Animation sub-state
@@ -310,10 +393,10 @@ function frame() {
   // ── Grid section ────────────────────────────────────────────────────────────
   buf += renderGrid(cols, innerW);
 
-  // ── Legend bar ──────────────────────────────────────────────────────────────
+  // ── Legend bar (inline, no bottom border — renderLog opens its own mid) ─────
   buf += renderLegend(cols, innerW);
 
-  // ── Activity log ────────────────────────────────────────────────────────────
+  // ── Pipeline + Activity split panel ─────────────────────────────────────────
   buf += renderLog(cols, innerW);
 
   // ── Stats / progress footer ─────────────────────────────────────────────────
@@ -513,65 +596,120 @@ function renderLegend(cols, innerW) {
   let s = '';
   s += hLine('mid', cols);
   s += `│ ${legend}${' '.repeat(pad)} │\n`;
-  s += hLine('mid', cols);
   return s;
 }
 
+// ── Pipeline panel (left column) ─────────────────────────────────────────────
+// Fixed 24-char wide left column showing per-stage status + stats
+const PIPE_W = 24;
+
+function renderPipelinePanel() {
+  const p = _state.pipeline;
+  const s = _state;
+
+  function stageLine(label, stageKey, detailFn) {
+    const stage = p[stageKey];
+    const st    = stage.status;
+    let icon, col;
+    if (st === 'done')    { icon = '✓'; col = fg.brightGreen; }
+    else if (st === 'active') { icon = '▶'; col = fg.brightCyan; }
+    else if (st === 'error')  { icon = '!'; col = fg.brightRed; }
+    else                      { icon = '·'; col = fg.brightBlack; }
+
+    const detail = detailFn ? detailFn(stage) : stage.detail || '';
+    const labelCol = st === 'active' ? `${fg.brightWhite}${style.bold}` : fg.brightBlack;
+    const line = `${labelCol}${label.padEnd(9)}${style.reset} ${col}${icon}${style.reset} ${fg.brightBlack}${detail}${style.reset}`;
+    return line;
+  }
+
+  const lines = [
+    stageLine('SCAN',     'scan',     (st) => st.detail || ''),
+    stageLine('GROUP',    'group',    (st) => st.detail || ''),
+    stageLine('EXTRACT',  'extract',  (st) => st.wallMs ? `${(st.wallMs/1000).toFixed(1)}s` : st.detail || ''),
+    stageLine('INDEX',    'index',    (st) => st.detail || ''),
+    stageLine('WRITE',    'write',    (st) => {
+      if (st.status === 'active' && st.sessionsTotal) return `${st.sessionsDone}/${st.sessionsTotal} ses`;
+      return st.detail || '';
+    }),
+    stageLine('CONCEPTS', 'concepts', (st) => {
+      if (st.status === 'active' && st.total) return `${st.done}/${st.total}`;
+      if (st.status === 'done') return `${st.done} written`;
+      return st.detail || '';
+    }),
+    stageLine('LINK',     'link',     (st) => st.detail || ''),
+  ];
+
+  // Warn/filter summary line
+  const warnParts = [];
+  if (s.filterCursor > 0)  warnParts.push(`${fg.brightBlack}skip:${fg.brightYellow}${s.filterCursor}${style.reset}`);
+  if (s.filterCodex  > 0)  warnParts.push(`${fg.brightBlack}inj:${fg.brightYellow}${s.filterCodex}${style.reset}`);
+  if (s.warnWeak     > 0)  warnParts.push(`${fg.brightBlack}weak:${fg.brightYellow}${s.warnWeak}${style.reset}`);
+  if (warnParts.length > 0) lines.push(warnParts.join(' '));
+  else lines.push('');
+
+  return lines;
+}
+
+// ── Split panel: Pipeline (left) + Activity (right) ──────────────────────────
 function renderLog(cols, innerW) {
-  // The outer box is cols wide: │ ... (innerW chars) ... │
-  // We draw an inner activity box indented 1 char on each side:
-  //   outer:  │ [space] inner-content [space] │
-  //   inner:  ┌─ Activity ──────────────────┐
-  //           │ log line                    │
-  //           └─────────────────────────────┘
-  // inner box width = innerW - 2  (1-space inset each side inside the outer │)
+  // Divider at PIPE_W + 3 chars from left (│space pipeline space│space activity...)
+  const dividerX  = PIPE_W + 2;  // where the │ divider sits
+  const actW      = innerW - dividerX - 2; // activity content width
 
-  const innerBoxW = innerW - 2;  // chars between the inner ┌ and ┐ (including them)
-  const label     = '─ Activity ';
-
-  // Inner border lines — exactly innerBoxW - 2 dash chars between ┌ and ┐
-  const dashCount  = Math.max(0, innerBoxW - 2);
-  const labelDash  = Math.max(0, dashCount - label.length);
-  const topBorder  = `┌${label}${'─'.repeat(labelDash)}┐`;
-  const botBorder  = `└${'─'.repeat(dashCount)}┘`;
-
-  // Each log line: outer │ + space + inner │ + space + content + space + inner │ + space + outer │
-  // That means inner content width = innerBoxW - 4  (│space ... space│)
-  const contentW = innerBoxW - 4;
+  // Build header row with column labels
+  const pipeLabel = `─ Pipeline ${'─'.repeat(Math.max(0, PIPE_W - 10))}`;
+  const actLabel  = `─ Activity ${'─'.repeat(Math.max(0, actW - 10))}`;
+  const midSep    = `┬${actLabel}`;
 
   let s = '';
-  s += `│ ${topBorder} │\n`;
+  s += `├${pipeLabel}${midSep}┤\n`;
 
-  const heartbeat   = maybeHeartbeat();
-  const entries     = _logBuffer.slice(-LOG_LINES);
-  while (entries.length < LOG_LINES) entries.unshift(null);
+  // Pipeline lines (left)
+  const pipeLines = renderPipelinePanel();
 
+  // Activity lines (right) — signal-only log, no per-file spam
+  const heartbeat  = maybeHeartbeat();
+  const LOG_ROWS   = Math.max(pipeLines.length, LOG_LINES);
+  const entries    = _logBuffer.slice(-LOG_ROWS);
+  while (entries.length < LOG_ROWS) entries.unshift(null);
   const recencyCount = entries.filter(Boolean).length;
 
-  entries.forEach((entry, i) => {
-    const isLastSlot  = i === LOG_LINES - 1;
-    // If silent, replace the last (most recent) slot with heartbeat pulse
-    const lineContent = (isLastSlot && heartbeat && !entry)
-      ? heartbeat
-      : entry ? formatLogEntry(entry) : '';
-    const plainLen    = (isLastSlot && heartbeat && !entry)
-      ? plainLength(heartbeat)
-      : entry ? plainLength(formatLogEntry(entry)) : 0;
-    const pad         = ' '.repeat(Math.max(0, contentW - plainLen));
+  for (let i = 0; i < LOG_ROWS; i++) {
+    // Left: pipeline
+    const pipeLine = pipeLines[i] || '';
+    const pipeLen  = plainLength(pipeLine);
+    const pipePad  = ' '.repeat(Math.max(0, PIPE_W - pipeLen));
 
-    // Bug 6: Dim entries older than 3 positions (was > 1) for a recency waterfall
-    const entryIndex  = entries.slice(0, i + 1).filter(Boolean).length - (entry ? 1 : 0);
-    const age         = recencyCount - 1 - entryIndex;
-    const isDim       = !entry || age > 3;
-    const dimOn       = isDim && !heartbeat ? style.dim : '';
-    const dimOff      = isDim && !heartbeat ? style.reset : '';
+    // Right: activity
+    const entry    = entries[i];
+    const isLast   = i === LOG_ROWS - 1;
+    const rawLine  = (isLast && heartbeat && !entry) ? heartbeat
+                   : entry ? formatLogEntry(entry) : '';
+    const rawLen   = (isLast && heartbeat && !entry) ? plainLength(heartbeat)
+                   : entry ? plainLength(formatLogEntry(entry)) : 0;
+    const actPad   = ' '.repeat(Math.max(0, actW - rawLen));
 
-    s += `│ │ ${dimOn}${lineContent}${pad}${dimOff} │ │\n`;
-  });
+    // Dim older entries
+    const eIdx  = entries.slice(0, i + 1).filter(Boolean).length - (entry ? 1 : 0);
+    const age   = recencyCount - 1 - eIdx;
+    const isDim = !entry || age > 3;
+    const dOn   = isDim && !heartbeat ? style.dim : '';
+    const dOff  = isDim && !heartbeat ? style.reset : '';
 
-  s += `│ ${botBorder} │\n`;
+    s += `│ ${pipeLine}${pipePad} │ ${dOn}${rawLine}${actPad}${dOff} │\n`;
+  }
+
+  // Close with a separator (no bottom border — footer follows)
+  const botPipe = `─`.repeat(PIPE_W);
+  const botAct  = `─`.repeat(actW + 2);
+  s += `├${botPipe}┴${botAct}┤\n`;
+
   return s;
 }
+
+// Log types that should be suppressed from the activity panel
+// (they update pipeline state directly instead)
+const SUPPRESS_FROM_ACTIVITY = new Set(['WRITE_FILE']);
 
 function formatLogEntry(entry) {
   const { type, text } = entry;
@@ -580,12 +718,22 @@ function formatLogEntry(entry) {
       return `${fg.brightYellow}[SCAN]${style.reset}    ${text}`;
     case 'EXTRACT':
       return `${fg.brightMagenta}[EXTRACT]${style.reset} ${text}`;
+    case 'EPISODE':
+      return `${fg.brightBlue}[EPISODE]${style.reset} ${text}`;
+    case 'FILTER':
+      return `${fg.brightYellow}[FILTER]${style.reset}  ${text}`;
+    case 'PERF':
+      return `${fg.brightBlack}[PERF]${style.reset}    ${text}`;
+    case 'DEBUG':
+      return `${fg.brightRed}[DEBUG]${style.reset}   ${text}`;
     case 'WRITE':
       return `${fg.brightCyan}[WRITE]${style.reset}   ${text}`;
     case 'LINK':
       return `${fg.brightGreen}[LINK]${style.reset}    ${text}`;
     case 'WARN':
       return `${fg.brightRed}[WARN]${style.reset}    ${text}`;
+    case 'DB':
+      return `${fg.brightBlack}[DB]${style.reset}      ${text}`;
     case 'DRY':
       return `${style.dim}[DRY]${style.reset}     ${text}`;
     case 'DONE':
@@ -852,6 +1000,22 @@ function update(patch) {
       }
     }
   }
+
+  // Pipeline stage updates
+  if (patch.pipeline) {
+    for (const [stage, data] of Object.entries(patch.pipeline)) {
+      if (_state.pipeline[stage]) Object.assign(_state.pipeline[stage], data);
+    }
+  }
+  // Write-phase granular counters
+  if (patch.writeSessions !== undefined) _state.writeSessions = patch.writeSessions;
+  if (patch.writeConcepts !== undefined) _state.writeConcepts = patch.writeConcepts;
+  if (patch.writeCode     !== undefined) _state.writeCode     = patch.writeCode;
+  if (patch.writeSkipped  !== undefined) _state.writeSkipped  = patch.writeSkipped;
+  if (patch.filterCursor  !== undefined) _state.filterCursor  = patch.filterCursor;
+  if (patch.filterCodex   !== undefined) _state.filterCodex   = patch.filterCodex;
+  if (patch.warnWeak      !== undefined) _state.warnWeak      = patch.warnWeak;
+  if (patch.episodes      !== undefined) _state.episodes      = patch.episodes;
 
   if (patch.currentSession !== undefined) _state.currentSession = patch.currentSession;
   if (patch.currentStage !== undefined) _state.currentStage = patch.currentStage;
