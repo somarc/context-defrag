@@ -75,7 +75,9 @@ async function mine({ since, verbose } = {}) {
   });
 
   unique.sort((a, b) => a.timestamp - b.timestamp);
-  return { source: 'cursor', sessions: unique };
+  const dropped = process._cursorMetaOnlyDropped || 0;
+  process._cursorMetaOnlyDropped = 0;
+  return { source: 'cursor', sessions: unique, metaOnlyDropped: dropped };
 }
 
 function mineWorkspaceStorage({ since, verbose }) {
@@ -477,7 +479,17 @@ function mergeCursorSessionCandidates(sessions) {
     }
   }
 
-  return merged;
+  // Drop any cursorMetaOnly sessions that were never upgraded to a real session.
+  // These are composer metadata entries with no corresponding chat transcript —
+  // they produce empty notes with zero signal. The scan logs 84 workspaces but
+  // each may contain hundreds of stale composer entries = ~5000 ghost sessions.
+  const realSessions = merged.filter(s => !s.cursorMetaOnly);
+  const metaOnly     = merged.length - realSessions.length;
+  if (metaOnly > 0 && typeof process !== 'undefined') {
+    // Emit a suppressible warning — picked up by the caller's verbose path
+    process._cursorMetaOnlyDropped = (process._cursorMetaOnlyDropped || 0) + metaOnly;
+  }
+  return realSessions;
 }
 
 function copyCursorMetadata(target, source) {
