@@ -67,16 +67,27 @@ let _cleanedUp = false;
 function cleanup() {
   if (_cleanedUp) return;
   _cleanedUp = true;
+  if (_renderInterval) { clearInterval(_renderInterval); _renderInterval = null; }
   if (ENABLED) {
+    // Restore stdin before exiting — critical when setRawMode was called
+    try {
+      if (process.stdin.isTTY && process.stdin.isRaw) {
+        process.stdin.setRawMode(false);
+      }
+      process.stdin.pause();
+    } catch (_) {}
     out(SHOW_CURSOR);
     out(ALT_SCREEN_OFF);
     out(RESET_ALL);
   }
 }
 
-process.on('exit',   cleanup);
+process.on('exit',    cleanup);
 process.on('SIGINT',  () => { cleanup(); process.exit(0); });
 process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+process.on('SIGHUP',  () => { cleanup(); process.exit(0); });
+// Uncaught exceptions — restore terminal before crashing
+process.on('uncaughtException', (err) => { cleanup(); throw err; });
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 // These are recalculated on each frame from actual terminal size
