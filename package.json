@@ -14,7 +14,10 @@
   ],
   "scripts": {
     "start": "node cli/defrag.js",
-    "test": "node cli/defrag.js --dry-run --verbose"
+    "test": "node cli/test_extractor.js && node cli/smoke_test_shutdown.js",
+    "test:unit": "node cli/test_extractor.js",
+    "test:smoke": "node cli/smoke_test_shutdown.js",
+    "test:dry": "node cli/defrag.js --dry-run --verbose --no-tui"
   },
   "dependencies": {
     "glob": "^10.3.10"
