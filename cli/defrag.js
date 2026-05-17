@@ -662,7 +662,9 @@ async function runPipeline(opts) {
   });
 
   // Inject summary lines into Activity log before the sign-off
-  tui.log(`[DONE] ${dedupedSessions.length} sessions → ${writeStats.written} files (${elapsedDisplay()})`);
+  const processedCount = sessionsToProcess.length;
+  const skippedCount   = dedupedSessions.length - processedCount;
+  tui.log(`[DONE] ${processedCount} sessions → ${writeStats.written} files (${elapsedDisplay()})${skippedCount > 0 ? ` [${skippedCount} filtered pre-extraction]` : ''}`);
   tui.log(`[DONE] Tiers: ▲${tierCounts.HIGH} high  ●${tierCounts.MEDIUM} medium  ·${tierCounts.LOW} low`);
   tui.log(`[DONE] Concepts: ${writeStats.promoted || 0} promoted, ${writeStats.lowSignalCount || 0} low-signal`);
   if (topPromoted.length > 0) {
@@ -671,7 +673,8 @@ async function runPipeline(opts) {
   tui.log('It is now safe to turn off your computer.');
 
   print('Complete!');
-  printStat('Sessions processed', dedupedSessions.length);
+  printStat('Sessions processed', sessionsToProcess.length);
+  if (skippedCount > 0) printStat('Sessions filtered', skippedCount);
   printStat('Session tiers',      `▲${tierCounts.HIGH} ●${tierCounts.MEDIUM} ·${tierCounts.LOW}`);
   printStat('Concepts extracted', effectiveConceptCount);
   printStat('Concepts promoted',  writeStats.promoted || 0);
