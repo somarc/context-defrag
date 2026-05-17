@@ -31,7 +31,7 @@ const { execFile }  = require('child_process');
 const claudeMiner  = require('./miners/claude');
 const codexMiner   = require('./miners/codex');
 const cursorMiner  = require('./miners/cursor');
-const { extractAsync, computeSignalScore, computeSessionScore, sessionTier }  = require('./extractor');
+const { extractAsync, computeSignalScore, buildSignalIndex, computeSessionScore, sessionTier }  = require('./extractor');
 const { write }    = require('./writers/obsidian');
 const { link }     = require('./writers/linker');
 const tui          = require('./tui');
@@ -570,12 +570,138 @@ async function runPipeline(opts) {
     await runQmdIntegration(opts.output, opts.verbose);
   }
 
+  // ── Phase 8: DB bridge (opt-in via --db) ────────────────────────────────
+  if (opts.db) {
+    await bridgeToDb(opts.db, enriched, writeStats, opts);
+  }
+
   await tui.done();
 
   // Close the log file stream if one was opened
   if (logStream) {
     logStream.end();
   }
+}
+
+// ── DB bridge ────────────────────────────────────────────────────────────────
+/**
+ * Optional ETL spine bridge: write thread + render_state rows for every session
+ * that was processed by the legacy pipeline.
+ *
+ * This is a one-way mirror — it does NOT read from the DB, only writes.
+ * Running without --db leaves the legacy pipeline completely unchanged.
+ *
+ * @param {string} dbPath       Resolved path to the SQLite database
+ * @param {{ session, extracted }[]} enriched   All processed sessions
+ * @param {{ written: number, written_paths?: string[] }} writeStats
+ * @param {object} opts         CLI options (for dryRun check)
+ */
+async function bridgeToDb(dbPath, enriched, writeStats, opts) {
+  let initDb;
+  try {
+    ({ initDb } = require('./db/schema'));
+  } catch (err) {
+    tui.log(`[DB] WARN Could not load schema module: ${err.message}`);
+    return;
+  }
+
+  let db;
+  try {
+    db = initDb(dbPath);
+  } catch (err) {
+    tui.log(`[DB] WARN Could not open database: ${err.message}`);
+    return;
+  }
+
+  const crypto = require('crypto');
+  const now    = Date.now();
+  let threadsWritten = 0;
+  let renderRows     = 0;
+
+  for (const { session } of enriched) {
+    try {
+      // Ensure a source row exists
+      db.prepare('INSERT OR IGNORE INTO sources (type, root_path) VALUES (?, ?)').run(
+        session.source,
+        session.filePath || session.source
+      );
+      const sourceId = db.prepare('SELECT id FROM sources WHERE root_path = ?')
+        .get(session.filePath || session.source).id;
+
+      // Ensure an artifact row exists for this session's file
+      db.prepare(`
+        INSERT OR IGNORE INTO artifacts (source_id, artifact_path, last_seen)
+        VALUES (?, ?, ?)
+      `).run(sourceId, session.filePath || '', now);
+
+      const artifactId = db.prepare(
+        'SELECT id FROM artifacts WHERE source_id = ? AND artifact_path = ?'
+      ).get(sourceId, session.filePath || '').id;
+
+      // Upsert the thread row (use session.id as the stable thread_key)
+      const startedAt = session.timestamp instanceof Date
+        ? session.timestamp.getTime()
+        : (typeof session.timestamp === 'number' ? session.timestamp : null);
+
+      const metadata = JSON.stringify({
+        format: session.format || null,
+        workspace: session.workspace || session.workspacePath || null,
+      });
+
+      db.prepare(`
+        INSERT INTO threads (artifact_id, thread_key, source_type, title, started_at,
+                             turn_count, workspace, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(thread_key) DO UPDATE SET
+          title      = excluded.title,
+          started_at = excluded.started_at,
+          turn_count = excluded.turn_count,
+          workspace  = excluded.workspace,
+          metadata   = excluded.metadata
+      `).run(
+        artifactId,
+        session.id,
+        session.source,
+        session.title || null,
+        startedAt,
+        session.turnCount || 0,
+        session.workspacePath || session.workspace || null,
+        metadata
+      );
+
+      threadsWritten++;
+    } catch (err) {
+      if (opts.verbose) {
+        tui.log(`[DB] WARN thread upsert failed for ${session.id}: ${err.message}`);
+      }
+    }
+  }
+
+  // Write render_state rows for each file the writer produced
+  // writeStats.writtenPaths is populated by the writer when available.
+  const writtenPaths = Array.isArray(writeStats.writtenPaths) ? writeStats.writtenPaths : [];
+  for (const notePath of writtenPaths) {
+    try {
+      const fs       = require('fs');
+      const relPath  = path.relative(opts.output, notePath);
+      const content  = fs.readFileSync(notePath, 'utf8');
+      const hash     = crypto.createHash('sha256').update(content).digest('hex');
+
+      db.prepare(`
+        INSERT INTO render_state (note_path, content_hash, source_type, written_at)
+        VALUES (?, ?, 'session', ?)
+        ON CONFLICT(note_path) DO UPDATE SET
+          content_hash = excluded.content_hash,
+          updated_at   = excluded.written_at
+      `).run(relPath, hash, now);
+
+      renderRows++;
+    } catch (_) {
+      // Best-effort — don't fail the whole pipeline over a render_state miss
+    }
+  }
+
+  tui.log(`[DB] Wrote ${threadsWritten} thread${threadsWritten !== 1 ? 's' : ''}, ${renderRows} render_state row${renderRows !== 1 ? 's' : ''} to ${path.basename(dbPath)}`);
 }
 
 // ── QMD integration ──────────────────────────────────────────────────────────
@@ -698,18 +824,20 @@ function setupWatchMode(opts) {
 // ── Argument parser ──────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const opts = {
-    output:    DEFAULT_OUT,
-    sources:   [...ALL_SOURCES],
-    dryRun:    false,
-    verbose:   false,
-    since:     null,
-    watch:     false,
-    model:     null,
-    gptKo:     false,
-    help:      false,
-    minSignal: DEFAULT_MIN_SIGNAL,
-    logFile:   null,
-    noTui:     false,
+    output:     DEFAULT_OUT,
+    sources:    [...ALL_SOURCES],
+    dryRun:     false,
+    verbose:    false,
+    since:      null,
+    watch:      false,
+    model:      null,
+    gptKo:      false,
+    help:       false,
+    minSignal:  DEFAULT_MIN_SIGNAL,
+    logFile:    null,
+    noTui:      false,
+    db:         null,   // optional: path to SQLite DB (ETL spine bridge)
+    allCursor:  false,  // bypass Cursor micro-session pre-filter
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -782,6 +910,14 @@ function parseArgs(argv) {
         opts.noTui = true;
         break;
 
+      case '--db':
+        opts.db = argv[++i];
+        break;
+
+      case '--all-cursor':
+        opts.allCursor = true;
+        break;
+
       case '--help':
       case '-h':
         opts.help = true;
@@ -796,6 +932,11 @@ function parseArgs(argv) {
 
   // Resolve output path
   opts.output = path.resolve(opts.output);
+
+  // Resolve DB path if supplied
+  if (opts.db) {
+    opts.db = path.resolve(opts.db);
+  }
 
   // Resolve log file path if supplied
   if (opts.logFile) {
@@ -1014,6 +1155,8 @@ OPTIONS
   --log-file <path>     Append all activity log entries to a plain-text file
   --no-tui              Disable the full-screen TUI; use plain console output instead.
                         Useful for CI, piping to a file, or debugging.
+  --db <path>           Write session threads and render_state rows to a SQLite DB
+                        (ETL spine bridge — see cli/sync.js for discovery-only mode)
   --help                Show this help message
 
 EXAMPLES
@@ -1026,6 +1169,7 @@ EXAMPLES
   npx context-defrag --min-signal 12
   npx context-defrag --min-signal 0     # every concept gets its own note
   npx context-defrag --log-file defrag.log --verbose
+  npx context-defrag --dry-run --db defrag.db --no-tui  # bridge test
 
 SOURCES
   claude   ~/.claude/projects/  (JSONL conversation files — Desktop & Code)
