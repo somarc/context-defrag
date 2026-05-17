@@ -25,16 +25,31 @@ const path = require('path');
  * @returns {{ linksCreated: number }}
  */
 function link({ vaultDir, dryRun, verbose, onProgress }) {
+  // Build registry from concept notes only — sessions/code notes don't receive
+  // incoming wikilinks from the linker (they already link outward during rendering)
   const registry = buildRegistry(vaultDir);
 
-  if (verbose) {
-    console.log(`  Registry: ${registry.length} notes indexed`);
+  // Cap registry to top 300 concepts by alias count (proxy for signal strength)
+  // Linking 4737 concepts into 8013 files = O(n²) catastrophe.
+  // 300 high-signal concepts × concept files only = manageable.
+  const cappedRegistry = registry
+    .filter(e => e.vaultPath.startsWith('concepts/'))
+    .sort((a, b) => (b.aliases.length + 1) - (a.aliases.length + 1))
+    .slice(0, 300);
+
+  if (onProgress) {
+    onProgress(`Registry: ${registry.length} notes → capped to ${cappedRegistry.length} high-signal concepts`);
   }
 
   let linksCreated = 0;
 
-  // Process all markdown files
-  const allFiles = collectMarkdownFiles(vaultDir);
+  // Only inject links into concept notes — not session notes, code, or indexes.
+  // Sessions already reference concepts via rendered wikilinks.
+  // Linking within concept notes creates the cross-concept graph.
+  const allFiles = collectMarkdownFiles(vaultDir).filter(f => {
+    const rel = path.relative(vaultDir, f);
+    return rel.startsWith('concepts' + path.sep) || rel.startsWith('concepts/');
+  });
 
   for (const filePath of allFiles) {
     let content;
@@ -44,7 +59,7 @@ function link({ vaultDir, dryRun, verbose, onProgress }) {
       continue;
     }
 
-    const { linked, count } = injectLinks(content, registry, filePath, vaultDir);
+    const { linked, count } = injectLinks(content, cappedRegistry, filePath, vaultDir);
 
     if (count > 0) {
       linksCreated += count;
