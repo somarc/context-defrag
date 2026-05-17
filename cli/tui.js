@@ -216,6 +216,10 @@ const _state = {
   lastUpdate: Date.now(),
   done:       false,
   currentSession: '',    // e.g. "[42/544] codex 2026-05-14" — shown during extraction
+  currentStage:   '',
+  currentDetail:  '',
+  currentFocus:   '',
+  currentQuality: '',
   // Session tier tracking
   tiersHigh:     0,
   tiersMedium:   0,
@@ -587,7 +591,8 @@ function renderFooter(cols, innerW) {
 
   let s = '';
   s += `│ ${barLabel} ${bar} ${fg.brightWhite}${pctStr}${style.reset}${' '.repeat(Math.max(0, innerW - barLabelLen - barWidth - pctStr.length - 3))} │\n`;
-  s += `│${' '.repeat(innerW)} │\n`;
+  const stateLine = buildCurrentStateLine(innerW);
+  s += `│ ${stateLine}${' '.repeat(Math.max(0, innerW - plainLength(stateLine) - 1))}│\n`;
 
   // Stats row — fixed-width columns so numbers don't jump around
   const stats = buildStatsRow(innerW);
@@ -649,6 +654,31 @@ function buildStatsRow(innerW) {
   return cols.join('   ');
 }
 
+function buildCurrentStateLine(innerW) {
+  if (!_state.currentStage && !_state.currentDetail && !_state.currentFocus) {
+    return `${fg.brightBlack}State${style.reset}  ${fg.brightWhite}${_state.phase.toLowerCase()}${style.reset}`;
+  }
+
+  const qualityColor = _state.currentQuality === 'blocked' || _state.currentQuality === 'weak'
+    ? fg.brightRed
+    : _state.currentQuality === 'resumed'
+      ? fg.brightYellow
+      : _state.currentQuality === 'rich'
+        ? fg.brightGreen
+        : fg.brightCyan;
+
+  const parts = [
+    `${fg.brightBlack}State${style.reset}  ${fg.brightWhite}${truncateDisplay(_state.currentStage || _state.phase, Math.max(12, innerW / 3))}${style.reset}`,
+  ];
+  if (_state.currentDetail) {
+    parts.push(`${fg.brightBlack}·${style.reset} ${qualityColor}${truncateDisplay(_state.currentDetail, Math.max(18, innerW / 2))}${style.reset}`);
+  }
+  if (_state.currentFocus) {
+    parts.push(`${fg.brightBlack}·${style.reset} ${fg.brightYellow}${truncateDisplay(_state.currentFocus, Math.max(12, innerW / 4))}${style.reset}`);
+  }
+  return parts.join(' ');
+}
+
 function stat(label, value, valueWidth) {
   const val = String(value === undefined ? 0 : value).padStart(valueWidth);
   return `${fg.brightBlack}${label}${style.reset}  ${fg.brightWhite}${val}${style.reset}`;
@@ -657,12 +687,17 @@ function stat(label, value, valueWidth) {
 function buildSourcesRow() {
   const ALL  = ['claude', 'codex', 'cursor'];
   const parts = ALL.map((src) => {
-    const status = (_state.sources || {})[src];
-    if (!status || status === 'scanning') {
+    const sourceState = (_state.sources || {})[src];
+    const status = typeof sourceState === 'string' ? sourceState : sourceState?.status;
+    const sessionCount = typeof sourceState === 'object' ? sourceState?.sessions : 0;
+    if (!status || status === 'pending' || status === 'scanning') {
       const dots = ['.  ', '.. ', '...'][Math.floor(_anim.sourceDotsFrame / 4) % 3];
       return `${fg.brightBlack}${src}${fg.brightBlack}${dots}${style.reset}`;
     } else if (status === 'found') {
-      return `${fg.brightBlack}${src} ${fg.brightGreen}✓${style.reset}`;
+      const count = sessionCount ? ` ${sessionCount}` : '';
+      return `${fg.brightBlack}${src}${count} ${fg.brightGreen}✓${style.reset}`;
+    } else if (status === 'error') {
+      return `${fg.brightBlack}${src} ${fg.brightRed}!${style.reset}`;
     } else {
       return `${fg.brightBlack}${src} —${style.reset}`;
     }
@@ -768,16 +803,28 @@ function update(patch) {
     // or an object from scanResults { claude: {found, sessions}, ... }
     if (Array.isArray(patch.sources)) {
       for (const src of patch.sources) {
-        _state.sources[src] = 'found';
+        _state.sources[src] = { status: 'found', found: true, sessions: 0 };
       }
     } else {
       for (const [src, data] of Object.entries(patch.sources)) {
-        _state.sources[src] = data.found ? 'found' : 'missing';
+        if (typeof data === 'string') {
+          _state.sources[src] = { status: data, found: data === 'found', sessions: 0 };
+        } else {
+          _state.sources[src] = {
+            status: data.status || (data.found ? 'found' : 'missing'),
+            found: Boolean(data.found),
+            sessions: data.sessions || 0,
+          };
+        }
       }
     }
   }
 
   if (patch.currentSession !== undefined) _state.currentSession = patch.currentSession;
+  if (patch.currentStage !== undefined) _state.currentStage = patch.currentStage;
+  if (patch.currentDetail !== undefined) _state.currentDetail = patch.currentDetail;
+  if (patch.currentFocus !== undefined) _state.currentFocus = patch.currentFocus;
+  if (patch.currentQuality !== undefined) _state.currentQuality = patch.currentQuality;
 
   // Tier counts and completion stats
   if (patch.tiersHigh   !== undefined) _state.tiersHigh   = patch.tiersHigh;
@@ -849,6 +896,12 @@ function parseLogEntry(str) {
 
 function stripBracketPrefix(str, type) {
   return str.replace(new RegExp(`^\\[${type}\\]\\s*`, 'i'), '').trim();
+}
+
+function truncateDisplay(str, max) {
+  const plain = String(str || '');
+  if (plain.length <= max) return plain;
+  return plain.slice(0, Math.max(0, max - 1)) + '…';
 }
 
 /**

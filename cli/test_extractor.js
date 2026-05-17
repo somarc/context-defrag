@@ -141,7 +141,32 @@ test('extract returns all expected fields', () => {
   assert(Array.isArray(result.snippets), 'snippets should be an array');
   assert(Array.isArray(result.urls), 'urls should be an array');
   assert(Array.isArray(result.entities), 'entities should be an array');
+  assert(result.continuity && typeof result.continuity === 'object', 'continuity should exist');
   assert(result.observability && typeof result.observability === 'object', 'observability should exist');
+});
+
+test('extract emits staged events and continuity state', () => {
+  const session = makeSession([
+    'We are back to the `cursor.js` extraction issue again. Still blocked on weak session recovery.',
+    'Next step: update `cursor.js`, inspect `cli/defrag.js`, and continue the fix.',
+    'I decided to switch to richer extraction state events before linking.',
+  ], {
+    source: 'cursor',
+    workspacePath: '/Users/me/context-defrag',
+    filesTouched: ['cli/miners/cursor.js', 'cli/defrag.js'],
+  });
+  const events = [];
+  const result = extract(session, {
+    onEvent: (event) => events.push(event.stage),
+  });
+  assert(events.length >= 5, 'should emit multiple extraction stages');
+  assertEqual(events[0], 'prepare', 'first stage should be prepare');
+  assert(events.includes('signals'), 'should emit structured signal stage');
+  assert(events.includes('continuity'), 'should emit continuity stage');
+  assertEqual(events[events.length - 1], 'complete', 'last stage should be complete');
+  assert(result.continuity.resumed, 'should detect resumed work');
+  assert(result.continuity.blocked, 'should detect blocked work');
+  assertEqual(result.continuity.phase, 'implementing', 'should classify current work phase');
 });
 
 test('extract finds backtick-wrapped concepts', () => {

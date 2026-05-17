@@ -147,6 +147,26 @@ function renderStructuredList(items, emptyText) {
     .join('\n');
 }
 
+function renderContinuitySection(continuity) {
+  if (!continuity) return '_No continuity data captured_';
+  const lines = [
+    `- Status: \`${continuity.status}\``,
+    `- Phase: \`${continuity.phase}\``,
+  ];
+  if (continuity.resumed) lines.push('- Resumed prior thread');
+  if (continuity.pivoted) lines.push('- Scope or approach pivot detected');
+  if (continuity.blocked) lines.push('- Blocked state detected');
+  if (continuity.unfinished) lines.push('- Unfinished work remains');
+  if (continuity.primaryThread) lines.push(`- Primary thread: \`${continuity.primaryThread}\``);
+  if (Array.isArray(continuity.activeThreads) && continuity.activeThreads.length > 0) {
+    lines.push(`- Active threads: ${continuity.activeThreads.map((name) => `\`${name}\``).join(', ')}`);
+  }
+  if (Array.isArray(continuity.openLoops) && continuity.openLoops.length > 0) {
+    lines.push(`- Open loops: ${continuity.openLoops.length}`);
+  }
+  return lines.join('\n');
+}
+
 function conceptRegex(concept) {
   const raw = String(concept || '');
   const escaped = escapeRegex(raw.toLowerCase());
@@ -224,6 +244,7 @@ function renderSessionNote(session, extracted) {
   const issueItems    = getStructuredItems(extracted.issues || []);
   const actionItems   = getStructuredItems(extracted.actionItems || []);
   const commitItems   = getStructuredItems(extracted.commits || []);
+  const continuity    = extracted.continuity || null;
 
   // ── Frontmatter extras (shared across all tiers) ──────────────────────────
   const fmExtras = [];
@@ -238,6 +259,11 @@ function renderSessionNote(session, extracted) {
   if (session.workspacePath) fmExtras.push(`workspace-path: "${escYaml(session.workspacePath)}"`);
   if (session.cursorFormat)  fmExtras.push(`cursor-format: ${session.cursorFormat}`);
   if (session.taskOutcome) fmExtras.push(`task-outcome: ${session.taskOutcome}`);
+  if (continuity?.status) fmExtras.push(`continuity-status: ${continuity.status}`);
+  if (continuity?.phase) fmExtras.push(`continuity-phase: ${continuity.phase}`);
+  if (continuity?.resumed) fmExtras.push('resumed: true');
+  if (continuity?.blocked) fmExtras.push('blocked: true');
+  if (continuity?.unfinished) fmExtras.push('unfinished: true');
   fmExtras.push(`issues: ${issueItems.length}`);
   fmExtras.push(`actions: ${actionItems.length}`);
   fmExtras.push(`commits: ${commitItems.length}`);
@@ -281,6 +307,7 @@ ${topConcepts}
   const issuesSection    = renderStructuredList(issueItems, '_None detected_');
   const actionsSection   = renderStructuredList(actionItems, '_None detected_');
   const commitsSection   = renderStructuredList(commitItems, '_None detected_');
+  const continuitySection = renderContinuitySection(continuity);
 
   // Top Concepts — inline pill style
   const topConceptLinks = topConceptNames.slice(0, 12).map((c) =>
@@ -398,6 +425,9 @@ ${issuesSection}
 ## Action Items
 ${actionsSection}
 
+## Session Continuity
+${continuitySection}
+
 ## Top Concepts
 ${topConceptLinks}
 
@@ -449,6 +479,9 @@ ${issuesSection}
 
 ## Action Items
 ${actionsSection}
+
+## Session Continuity
+${continuitySection}
 
 ## Change Signals
 ${commitsSection}

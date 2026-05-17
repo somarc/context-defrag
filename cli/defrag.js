@@ -31,7 +31,7 @@ const { execFile }  = require('child_process');
 const claudeMiner  = require('./miners/claude');
 const codexMiner   = require('./miners/codex');
 const cursorMiner  = require('./miners/cursor');
-const { extract, computeSignalScore, computeSessionScore, sessionTier }  = require('./extractor');
+const { extractAsync, computeSignalScore, computeSessionScore, sessionTier }  = require('./extractor');
 const { write }    = require('./writers/obsidian');
 const { link }     = require('./writers/linker');
 const tui          = require('./tui');
@@ -118,7 +118,7 @@ async function runPipeline(opts) {
   // Mark all requested sources as 'scanning'
   const initialSources = {};
   for (const src of ALL_SOURCES) {
-    initialSources[src] = { found: false, sessions: 0 };
+    initialSources[src] = { status: 'pending', found: false, sessions: 0 };
   }
   tui.update({ sources: initialSources });
 
@@ -135,8 +135,10 @@ async function runPipeline(opts) {
     // Animate the source as "scanning" while we mine it
     const scanningPatch = {};
     for (const src of ALL_SOURCES) {
-      scanningPatch[src] = { found: false, sessions: 0 };
+      const existing = scanResults[src];
+      scanningPatch[src] = existing || { status: 'pending', found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[src] };
     }
+    scanningPatch[source] = { ...(scanningPatch[source] || {}), status: 'scanning', found: false };
     // Mark this source as scanning (will show animated dots)
     tui.update({ sources: scanningPatch });
 
@@ -151,7 +153,7 @@ async function runPipeline(opts) {
       result = await miner.mine({ since: sinceDate, verbose: opts.verbose });
     } catch (err) {
       printStatus('ERR', SOURCE_DISPLAY_PATHS[source], err.message);
-      scanResults[source] = { found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
+      scanResults[source] = { status: 'error', found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
       continue;
     }
 
@@ -159,10 +161,10 @@ async function runPipeline(opts) {
 
     if (skipped && sessions.length === 0) {
       printStatus('--', SOURCE_DISPLAY_PATHS[source], 'Not found, skipping');
-      scanResults[source] = { found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
+      scanResults[source] = { status: 'missing', found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
     } else {
       printStatus('OK', SOURCE_DISPLAY_PATHS[source], `${sessions.length} conversation${sessions.length !== 1 ? 's' : ''} found`);
-      scanResults[source] = { found: true, sessions: sessions.length, path: SOURCE_DISPLAY_PATHS[source] };
+      scanResults[source] = { status: 'found', found: true, sessions: sessions.length, path: SOURCE_DISPLAY_PATHS[source] };
     }
 
     allSessions.push(...sessions);
@@ -179,7 +181,7 @@ async function runPipeline(opts) {
   // Fill in any sources that weren't processed (filtered out via --sources)
   for (const source of ALL_SOURCES) {
     if (!(source in scanResults)) {
-      scanResults[source] = { found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
+      scanResults[source] = { status: 'pending', found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
     }
   }
 
@@ -226,6 +228,13 @@ async function runPipeline(opts) {
     truncatedSessions: 0,
     weakSessions: [],
     sourceStats: {},
+    continuity: {
+      resumedSessions: 0,
+      blockedSessions: 0,
+      unfinishedSessions: 0,
+      statusCounts: {},
+      phaseCounts: {},
+    },
   };
 
   for (let si = 0; si < total; si++) {
@@ -233,14 +242,31 @@ async function runPipeline(opts) {
 
     // ── Pre-extraction: show what we're working on BEFORE the blocking call ─
     const pctPre = 10 + Math.floor((si / total) * 55);
+    const pctMax = 10 + Math.floor(((si + 1) / total) * 55);
     tui.update({
       phase: 'EXTRACTING', pct: pctPre, sessions: si,
       currentSession: `[${si + 1}/${total}] ${session.source} ${isoDate(session.timestamp)}`,
     });
     await new Promise(resolve => setImmediate(resolve));
 
-    const extracted = extract(session);
+    const extracted = await extractAsync(session, {
+      onEvent: (event) => {
+        const sessionSpan = Math.max(1, pctMax - pctPre);
+        const stagePct = pctPre + Math.min(sessionSpan - 1, Math.floor(sessionSpan * Math.max(0, Math.min(0.98, event.progress || 0))));
+        tui.update({
+          phase: 'EXTRACTING',
+          pct: stagePct,
+          sessions: si,
+          currentSession: `[${si + 1}/${total}] ${session.source} ${isoDate(session.timestamp)}`,
+          currentStage: event.label || '',
+          currentDetail: event.detail || '',
+          currentFocus: event.focus || '',
+          currentQuality: event.quality || '',
+        });
+      },
+    });
     const obs = extracted.observability || null;
+    const continuity = extracted.continuity || obs?.continuity || null;
 
     // ── Compute session signal score and tier ───────────────────────────
     const sessScore = computeSessionScore(session, extracted);
@@ -252,7 +278,7 @@ async function runPipeline(opts) {
     session._sessionTier  = tier;
 
     // ── Progress within the 10–65% extraction band ──────────────────────
-    const pct = 10 + Math.floor(((si + 1) / total) * 55); // 10–65%
+    const pct = pctMax; // 10–65%
 
     // ── Always log a compact per-session line ───────────────────────────
     const decisionCount = extracted.decisions ? extracted.decisions.length : 0;
@@ -260,8 +286,9 @@ async function runPipeline(opts) {
     const actionCount   = extracted.actionItems ? extracted.actionItems.length : 0;
     const commitCount   = extracted.commits ? extracted.commits.length : 0;
     const tierTag       = tier === 'HIGH' ? '▲' : tier === 'MEDIUM' ? '●' : '·';
+    const continuityTag = continuity ? `${continuity.status}/${continuity.phase}` : 'unknown';
     tui.log(
-      `[EXTRACT] ${tierTag} ${session.source} ${isoDate(session.timestamp)} "${truncate(session.title, 36)}" — ${extracted.concepts.length}c ${decisionCount}d ${issueCount}i ${actionCount}a ${commitCount}g`
+      `[EXTRACT] ${tierTag} ${session.source} ${isoDate(session.timestamp)} "${truncate(session.title, 36)}" — ${extracted.concepts.length}c ${decisionCount}d ${issueCount}i ${actionCount}a ${commitCount}g · ${continuityTag}`
     );
 
     if (obs) {
@@ -270,13 +297,28 @@ async function runPipeline(opts) {
         weak: 0,
         concepts: 0,
         structured: 0,
+        resumed: 0,
+        blocked: 0,
+        unfinished: 0,
       };
       sourceBucket.sessions++;
       sourceBucket.concepts += obs.conceptCount || 0;
       sourceBucket.structured += (obs.decisionCount || 0) + (obs.issueCount || 0) + (obs.actionItemCount || 0) + (obs.commitCount || 0);
+      if (continuity?.resumed) sourceBucket.resumed++;
+      if (continuity?.blocked) sourceBucket.blocked++;
+      if (continuity?.unfinished) sourceBucket.unfinished++;
 
       if (obs.truncated) extractionHealth.truncatedSessions++;
       if (session.cursorMetaOnly) extractionHealth.metadataOnlyCursorSessions++;
+      if (continuity?.resumed) extractionHealth.continuity.resumedSessions++;
+      if (continuity?.blocked) extractionHealth.continuity.blockedSessions++;
+      if (continuity?.unfinished) extractionHealth.continuity.unfinishedSessions++;
+      if (continuity?.status) {
+        extractionHealth.continuity.statusCounts[continuity.status] = (extractionHealth.continuity.statusCounts[continuity.status] || 0) + 1;
+      }
+      if (continuity?.phase) {
+        extractionHealth.continuity.phaseCounts[continuity.phase] = (extractionHealth.continuity.phaseCounts[continuity.phase] || 0) + 1;
+      }
       if (Array.isArray(obs.weakSignals) && obs.weakSignals.length > 0) {
         extractionHealth.weakSessionCount++;
         sourceBucket.weak++;
@@ -287,6 +329,11 @@ async function runPipeline(opts) {
             source: session.source,
             date: isoDate(session.timestamp),
             weakSignals: obs.weakSignals,
+            continuity: continuity ? {
+              status: continuity.status,
+              phase: continuity.phase,
+              markers: continuity.markers,
+            } : null,
           });
         }
         tui.log(`[WARN] Weak extraction ${session.source} "${truncate(session.title, 30)}" — ${obs.weakSignals.join(', ')}`);
@@ -316,6 +363,10 @@ async function runPipeline(opts) {
     tui.update({
       phase: 'EXTRACTING', pct, sessions: si + 1, concepts: conceptFreq.size,
       tiersHigh: tierCounts.HIGH, tiersMedium: tierCounts.MEDIUM, tiersLow: tierCounts.LOW,
+      currentStage: continuity ? `Session state: ${continuity.status} · ${continuity.phase}` : '',
+      currentDetail: continuity ? summarizeContinuityState(continuity) : '',
+      currentFocus: continuity?.primaryThread || '',
+      currentQuality: obs?.weakSignals?.length ? 'weak' : 'steady',
     });
     await new Promise(resolve => setImmediate(resolve));
 
@@ -329,6 +380,7 @@ async function runPipeline(opts) {
 
   tui.log(`[SCAN] Session tiers: ${tierCounts.HIGH} high, ${tierCounts.MEDIUM} medium, ${tierCounts.LOW} low`);
   tui.log(`[SCAN] Extraction health: ${extractionHealth.weakSessionCount} weak, ${extractionHealth.metadataOnlyCursorSessions} cursor-metadata-only, ${extractionHealth.truncatedSessions} truncated`);
+  tui.log(`[SCAN] Continuity: ${extractionHealth.continuity.resumedSessions} resumed, ${extractionHealth.continuity.blockedSessions} blocked, ${extractionHealth.continuity.unfinishedSessions} unfinished`);
 
   const totalConcepts = conceptFreq.size;
   const totalSnippets = enriched.reduce((n, { extracted }) => n + extracted.snippets.length, 0);
@@ -341,7 +393,7 @@ async function runPipeline(opts) {
   const conceptSummaries = buildConceptSummaries(enriched);
   const effectiveConceptCount = conceptSummaries.length || totalConcepts;
 
-  tui.update({ phase: 'WRITING', pct: 65, concepts: effectiveConceptCount });
+  tui.update({ phase: 'WRITING', pct: 65, concepts: effectiveConceptCount, currentStage: 'Writing structured vault', currentDetail: '', currentFocus: '', currentQuality: '' });
   tui.log(`[SCAN] Extracted ${effectiveConceptCount} concept${effectiveConceptCount !== 1 ? 's' : ''}, ${totalSnippets} snippet${totalSnippets !== 1 ? 's' : ''}`);
 
   print('');
@@ -380,7 +432,7 @@ async function runPipeline(opts) {
     die(`Write error: ${err.message}`);
   }
 
-  tui.update({ phase: 'LINKING', pct: 85, files: writeStats.written });
+  tui.update({ phase: 'LINKING', pct: 85, files: writeStats.written, currentStage: 'Linking extracted concepts', currentDetail: '', currentFocus: '', currentQuality: '' });
   tui.log(`[WRITE] Vault written — ${writeStats.written} file${writeStats.written !== 1 ? 's' : ''}`);
 
   print('');
@@ -411,7 +463,7 @@ async function runPipeline(opts) {
     }
   }
 
-  tui.update({ phase: 'LINKING', pct: 98, links: linkStats.linksCreated });
+  tui.update({ phase: 'LINKING', pct: 98, links: linkStats.linksCreated, currentStage: 'Link graph stabilized', currentDetail: '', currentFocus: '', currentQuality: '' });
 
   // Print top linked concepts
   const topLinked = [...conceptFreq.entries()]
@@ -482,6 +534,10 @@ async function runPipeline(opts) {
     promoted:    writeStats.promoted    || 0,
     lowSignal:   writeStats.lowSignalCount || 0,
     topConcepts: topPromoted,
+    currentStage: 'Vault complete',
+    currentDetail: '',
+    currentFocus: '',
+    currentQuality: '',
   });
 
   // Inject summary lines into Activity log before the sign-off
@@ -785,6 +841,7 @@ function buildSessionSummaries(enriched) {
     format: session.format || session.cursorFormat || null,
     topConcepts: (extracted.concepts || []).slice(0, 5),
     weakSignals: extracted.observability?.weakSignals || [],
+    continuity: extracted.continuity || null,
   }));
 }
 
@@ -888,8 +945,20 @@ function buildObservabilitySummary(enriched, extractionHealth) {
       sourceStats: extractionHealth.sourceStats,
       weakSessions: extractionHealth.weakSessions,
     },
+    continuity: extractionHealth.continuity,
     topSignalSessions,
   };
+}
+
+function summarizeContinuityState(continuity) {
+  if (!continuity) return '';
+  const parts = [];
+  if (continuity.resumed) parts.push('resumed');
+  if (continuity.pivoted) parts.push('pivoted');
+  if (continuity.blocked) parts.push('blocked');
+  if (continuity.unfinished && !continuity.blocked) parts.push('unfinished');
+  if (continuity.openLoops?.length) parts.push(`${continuity.openLoops.length} open loop${continuity.openLoops.length !== 1 ? 's' : ''}`);
+  return parts.join(' · ');
 }
 
 // ── Output helpers ────────────────────────────────────────────────────────────

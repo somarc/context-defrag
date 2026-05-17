@@ -117,6 +117,27 @@ const COMMIT_PATTERNS = [
   /\b[0-9a-f]{7,40}\b/i,
 ];
 
+const RESUME_PATTERNS = [
+  /\b(continue|continuing|continued|resume|resuming|resumed)\b/i,
+  /\b(pick(?:ing)? up|back to|return(?:ing)? to|revisit(?:ing)?)\b/i,
+  /\b(still|again|follow.?up|as discussed|same issue|previously)\b/i,
+];
+
+const BLOCKER_PATTERNS = [
+  /\b(blocked|stuck|waiting on|pending|cannot proceed|can'?t proceed|unable to continue)\b/i,
+  /\b(has blocking pending actions|needs unblock|waiting for)\b/i,
+];
+
+const PIVOT_PATTERNS = [
+  /\b(instead|rather than|pivot|switched|changed course|moved away from)\b/i,
+  /\b(replace|replaced|migrated from|migrating away)\b/i,
+];
+
+const RESOLUTION_PATTERNS = [
+  /\b(fixed|resolved|working now|works now|unblocked|done|complete|completed)\b/i,
+  /\b(merged|landed|shipped|closed out|finalized)\b/i,
+];
+
 // ── Sentences that signal a strong excerpt (decision or problem framing) ─────
 const EXCERPT_SIGNAL_PATTERNS = [
   // Decision language
@@ -153,86 +174,260 @@ const PASCAL_RE = /\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b/g;
 const MAX_EXTRACT_TEXT_LENGTH = 500_000;
 const MAX_CONCEPTS_PER_SESSION = 40;
 
-function extract(session) {
+function extract(session, opts = {}) {
+  const ctx = createExtractionContext(session, opts);
+  runExtractionStages(ctx);
+  return finalizeExtractionResult(ctx);
+}
+
+async function extractAsync(session, opts = {}) {
+  const ctx = createExtractionContext(session, { ...opts, deferEvents: true });
+  await runExtractionStagesAsync(ctx);
+  return finalizeExtractionResult(ctx);
+}
+
+function createExtractionContext(session, opts = {}) {
   const messages = Array.isArray(session?.messages)
     ? session.messages.filter((m) => m && typeof m.content === 'string' && m.content.trim())
     : [];
 
   let fullText = messages.map((m) => m.content).join('\n\n');
   const originalLength = fullText.length;
-
-  // Truncate excessively long sessions to prevent regex stalls
-  if (fullText.length > MAX_EXTRACT_TEXT_LENGTH) {
+  const truncated = fullText.length > MAX_EXTRACT_TEXT_LENGTH;
+  if (truncated) {
     fullText = fullText.slice(0, MAX_EXTRACT_TEXT_LENGTH);
   }
 
-  const snippets    = extractSnippets(fullText);
-  const urls        = extractUrls(fullText);
-  const entities    = extractEntities(fullText);
-  const files       = extractFileReferences(fullText, session);
-  const tools       = extractToolContext(session, fullText);
-  const workspaces  = extractWorkspaceContext(session);
-  const skills      = Array.isArray(session.skillsUsed) ? session.skillsUsed.filter(Boolean) : [];
-
-  const decisionItems = extractStructuredItems(messages, DECISION_PATTERNS, 'decision');
-  const issueItems    = extractStructuredItems(messages, ISSUE_PATTERNS, 'issue');
-  const actionItems   = extractStructuredItems(messages, ACTION_ITEM_PATTERNS, 'action');
-  const commitItems   = extractStructuredItems(messages, COMMIT_PATTERNS, 'commit');
-
-  const conceptObjects = buildConceptObjects({
+  return {
     session,
-    fullText,
     messages,
-    snippets,
-    urls,
-    entities,
-    files,
-    tools,
-    workspaces,
-    skills,
-    decisionItems,
-    issueItems,
-    actionItems,
-    commitItems,
+    fullText,
+    originalLength,
+    truncated,
+    reporter: createExtractionReporter(session, opts),
+    snippets: [],
+    urls: [],
+    entities: [],
+    files: [],
+    tools: [],
+    workspaces: [],
+    skills: Array.isArray(session?.skillsUsed) ? session.skillsUsed.filter(Boolean) : [],
+    decisionItems: [],
+    issueItems: [],
+    actionItems: [],
+    commitItems: [],
+    conceptObjects: [],
+    continuity: null,
+  };
+}
+
+function runExtractionStages(ctx) {
+  runPrepareStage(ctx);
+  runArtifactStage(ctx);
+  runContextStage(ctx);
+  runSignalStage(ctx);
+  runConceptStage(ctx);
+  runContinuityStage(ctx);
+}
+
+async function runExtractionStagesAsync(ctx) {
+  runPrepareStage(ctx);
+  await yieldToEventLoop();
+  runArtifactStage(ctx);
+  await yieldToEventLoop();
+  runContextStage(ctx);
+  await yieldToEventLoop();
+  runSignalStage(ctx);
+  await yieldToEventLoop();
+  runConceptStage(ctx);
+  await yieldToEventLoop();
+  runContinuityStage(ctx);
+  await yieldToEventLoop();
+}
+
+function runPrepareStage(ctx) {
+  ctx.reporter.emit('prepare', {
+    progress: 0.05,
+    label: 'Assembling session text',
+    detail: `${ctx.messages.length} message${ctx.messages.length !== 1 ? 's' : ''} · ${formatCount(ctx.originalLength)} chars`,
+    quality: ctx.truncated ? 'truncated' : 'steady',
+  });
+}
+
+function runArtifactStage(ctx) {
+  ctx.snippets = extractSnippets(ctx.fullText);
+  ctx.urls = extractUrls(ctx.fullText);
+  ctx.entities = extractEntities(ctx.fullText);
+  ctx.reporter.emit('artifacts', {
+    progress: 0.2,
+    label: 'Reading code and links',
+    detail: `${ctx.snippets.length} snippet${ctx.snippets.length !== 1 ? 's' : ''} · ${ctx.urls.length} url${ctx.urls.length !== 1 ? 's' : ''}`,
+    quality: ctx.snippets.length > 0 || ctx.urls.length > 0 ? 'rich' : 'steady',
+  });
+}
+
+function runContextStage(ctx) {
+  ctx.files = extractFileReferences(ctx.fullText, ctx.session);
+  ctx.tools = extractToolContext(ctx.session, ctx.fullText);
+  ctx.workspaces = extractWorkspaceContext(ctx.session);
+  ctx.reporter.emit('context', {
+    progress: 0.38,
+    label: 'Recovering technical context',
+    detail: `${ctx.files.length} file${ctx.files.length !== 1 ? 's' : ''} · ${ctx.tools.length} tool${ctx.tools.length !== 1 ? 's' : ''} · ${ctx.workspaces.length} workspace${ctx.workspaces.length !== 1 ? 's' : ''}`,
+    focus: ctx.files[0] || ctx.workspaces[0] || '',
+    quality: ctx.files.length > 0 || ctx.tools.length > 0 ? 'rich' : 'thin',
+  });
+}
+
+function runSignalStage(ctx) {
+  ctx.decisionItems = extractStructuredItems(ctx.messages, DECISION_PATTERNS, 'decision');
+  ctx.issueItems = extractStructuredItems(ctx.messages, ISSUE_PATTERNS, 'issue');
+  ctx.actionItems = extractStructuredItems(ctx.messages, ACTION_ITEM_PATTERNS, 'action');
+  ctx.commitItems = extractStructuredItems(ctx.messages, COMMIT_PATTERNS, 'commit');
+  ctx.reporter.emit('signals', {
+    progress: 0.56,
+    label: 'Classifying work signals',
+    detail: `${ctx.decisionItems.length} decision${ctx.decisionItems.length !== 1 ? 's' : ''} · ${ctx.issueItems.length} issue${ctx.issueItems.length !== 1 ? 's' : ''} · ${ctx.actionItems.length} action${ctx.actionItems.length !== 1 ? 's' : ''} · ${ctx.commitItems.length} change`,
+    quality: ctx.decisionItems.length || ctx.issueItems.length || ctx.actionItems.length || ctx.commitItems.length ? 'rich' : 'thin',
+  });
+}
+
+function runConceptStage(ctx) {
+  ctx.conceptObjects = buildConceptObjects({
+    session: ctx.session,
+    fullText: ctx.fullText,
+    messages: ctx.messages,
+    snippets: ctx.snippets,
+    urls: ctx.urls,
+    entities: ctx.entities,
+    files: ctx.files,
+    tools: ctx.tools,
+    workspaces: ctx.workspaces,
+    skills: ctx.skills,
+    decisionItems: ctx.decisionItems,
+    issueItems: ctx.issueItems,
+    actionItems: ctx.actionItems,
+    commitItems: ctx.commitItems,
+  });
+  ctx.reporter.emit('concepts', {
+    progress: 0.74,
+    label: 'Building concept evidence',
+    detail: `${ctx.conceptObjects.length} concept${ctx.conceptObjects.length !== 1 ? 's' : ''}`,
+    focus: ctx.conceptObjects[0]?.name || '',
+    quality: ctx.conceptObjects.length >= 6 ? 'rich' : ctx.conceptObjects.length > 0 ? 'steady' : 'thin',
+  });
+}
+
+function runContinuityStage(ctx) {
+  ctx.continuity = extractSessionContinuity(ctx.session, {
+    messages: ctx.messages,
+    conceptObjects: ctx.conceptObjects,
+    decisionItems: ctx.decisionItems,
+    issueItems: ctx.issueItems,
+    actionItems: ctx.actionItems,
+    commitItems: ctx.commitItems,
+    files: ctx.files,
+    tools: ctx.tools,
+  });
+  ctx.reporter.emit('continuity', {
+    progress: 0.9,
+    label: 'Reconstructing session continuity',
+    detail: summarizeContinuity(ctx.continuity),
+    focus: ctx.continuity.primaryThread || '',
+    quality: ctx.continuity.status === 'blocked' ? 'blocked' : ctx.continuity.resumed ? 'resumed' : 'steady',
+  });
+}
+
+function finalizeExtractionResult(ctx) {
+  const observability = buildExtractionObservability({
+    source: ctx.session?.source || 'unknown',
+    originalLength: ctx.originalLength,
+    extractedLength: ctx.fullText.length,
+    truncated: ctx.truncated,
+    conceptObjects: ctx.conceptObjects,
+    decisionItems: ctx.decisionItems,
+    issueItems: ctx.issueItems,
+    actionItems: ctx.actionItems,
+    commitItems: ctx.commitItems,
+    snippets: ctx.snippets,
+    urls: ctx.urls,
+    files: ctx.files,
+    tools: ctx.tools,
+    metaOnly: Boolean(ctx.session?.cursorMetaOnly),
+    continuity: ctx.continuity,
+    stageTrace: ctx.reporter.stageTrace,
   });
 
-  return {
-    concepts: conceptObjects.map((concept) => concept.name),
-    conceptObjects,
-    decisions: decisionItems.map((item) => item.text),
-    decisionItems,
-    issues: issueItems,
-    actionItems,
-    commits: commitItems,
-    snippets,
-    urls,
-    entities,
-    files,
-    tools,
+  const result = {
+    concepts: ctx.conceptObjects.map((concept) => concept.name),
+    conceptObjects: ctx.conceptObjects,
+    decisions: ctx.decisionItems.map((item) => item.text),
+    decisionItems: ctx.decisionItems,
+    issues: ctx.issueItems,
+    actionItems: ctx.actionItems,
+    commits: ctx.commitItems,
+    snippets: ctx.snippets,
+    urls: ctx.urls,
+    entities: ctx.entities,
+    files: ctx.files,
+    tools: ctx.tools,
+    continuity: ctx.continuity,
     technicalContext: {
-      files,
-      tools,
-      workspaces,
-      skills,
-      entities,
+      files: ctx.files,
+      tools: ctx.tools,
+      workspaces: ctx.workspaces,
+      skills: ctx.skills,
+      entities: ctx.entities,
+      continuity: ctx.continuity,
     },
-    observability: buildExtractionObservability({
-      source: session?.source || 'unknown',
-      originalLength,
-      extractedLength: fullText.length,
-      truncated: originalLength > fullText.length,
-      conceptObjects,
-      decisionItems,
-      issueItems,
-      actionItems,
-      commitItems,
-      snippets,
-      urls,
-      files,
-      tools,
-      metaOnly: Boolean(session?.cursorMetaOnly),
-    }),
+    observability,
   };
+
+  if (ctx.reporter.onEvent) {
+    ctx.reporter.onEvent({
+      stage: 'complete',
+      progress: 1,
+      label: 'Session extraction complete',
+      detail: `${result.concepts.length} concepts · ${ctx.continuity.status}`,
+      focus: ctx.continuity.primaryThread || '',
+      quality: observability.weakSignals.length > 0 ? 'weak' : 'rich',
+    });
+  }
+
+  return result;
+}
+
+function createExtractionReporter(session, opts = {}) {
+  const onEvent = typeof opts.onEvent === 'function' ? opts.onEvent : null;
+  const stageTrace = [];
+
+  return {
+    onEvent,
+    stageTrace,
+    emit(stage, payload = {}) {
+      const event = {
+        stage,
+        progress: payload.progress ?? 0,
+        label: payload.label || stage,
+        detail: payload.detail || '',
+        focus: payload.focus || '',
+        quality: payload.quality || '',
+        source: session?.source || 'unknown',
+        sessionId: session?.id || null,
+      };
+      stageTrace.push(event);
+      if (onEvent && !opts.deferEvents) onEvent(event);
+      return event;
+    },
+  };
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
 }
 
 // ── Concepts ─────────────────────────────────────────────────────────────────
@@ -750,6 +945,83 @@ function extractWorkspaceContext(session) {
   return workspaces.slice(0, 6);
 }
 
+function extractSessionContinuity(session, {
+  messages,
+  conceptObjects,
+  decisionItems,
+  issueItems,
+  actionItems,
+  commitItems,
+  files,
+  tools,
+}) {
+  const humanMessages = (messages || []).filter((msg) => msg.role === 'human' || msg.role === 'user');
+  const assistantMessages = (messages || []).filter((msg) => msg.role === 'assistant' || msg.role === 'bot');
+  const openingWindow = humanMessages.slice(0, 2).map((msg) => msg.content).join('\n\n');
+  const closingWindow = assistantMessages.slice(-2).map((msg) => msg.content).join('\n\n');
+  const resumed = RESUME_PATTERNS.some((re) => re.test(openingWindow));
+  const blocked = BLOCKER_PATTERNS.some((re) => re.test(openingWindow))
+    || issueItems.some((item) => BLOCKER_PATTERNS.some((re) => re.test(item.text || '')))
+    || Boolean(session?.cursorMeta?.hasBlockingPendingActions);
+  const pivoted = PIVOT_PATTERNS.some((re) => re.test(openingWindow))
+    || decisionItems.some((item) => PIVOT_PATTERNS.some((re) => re.test(item.text || '')));
+  const resolved = RESOLUTION_PATTERNS.some((re) => re.test(closingWindow))
+    || commitItems.some((item) => RESOLUTION_PATTERNS.some((re) => re.test(item.text || '')));
+  const unfinished = blocked || (!resolved && (actionItems.length > 0 || issueItems.length > 0));
+
+  let phase = 'exploring';
+  if (commitItems.length > 0 || resolved) {
+    phase = 'shipping';
+  } else if (files.length > 0 || tools.length > 0 || messages.length >= 6) {
+    phase = 'implementing';
+  } else if (decisionItems.length > 0) {
+    phase = 'deciding';
+  } else if (issueItems.length > 0) {
+    phase = 'investigating';
+  }
+
+  const activeThreads = (conceptObjects || []).slice(0, 4).map((concept) => concept.name);
+  const primaryThread = activeThreads[0] || session?.title || 'session';
+  const openLoops = actionItems.slice(0, 3).map((item) => item.text);
+  const markers = [];
+  if (resumed) markers.push('resumed');
+  if (pivoted) markers.push('pivoted');
+  if (blocked) markers.push('blocked');
+  if (unfinished) markers.push('unfinished');
+  if (resolved) markers.push('resolved');
+
+  let status = 'in-flight';
+  if (blocked) status = 'blocked';
+  else if (resolved && !unfinished) status = 'resolved';
+  else if (resumed) status = 'resumed';
+
+  return {
+    status,
+    phase,
+    resumed,
+    blocked,
+    unfinished,
+    pivoted,
+    resolved,
+    primaryThread,
+    activeThreads,
+    openLoops,
+    markers,
+    turnCount: messages.length,
+    humanTurns: humanMessages.length,
+    assistantTurns: assistantMessages.length,
+  };
+}
+
+function summarizeContinuity(continuity) {
+  if (!continuity) return 'continuity unavailable';
+  const parts = [continuity.status, continuity.phase];
+  if (continuity.resumed) parts.push('resumed thread');
+  if (continuity.blocked) parts.push('blocked');
+  if (continuity.openLoops.length > 0) parts.push(`${continuity.openLoops.length} open loop${continuity.openLoops.length !== 1 ? 's' : ''}`);
+  return parts.join(' · ');
+}
+
 function buildExtractionObservability({
   source,
   originalLength,
@@ -765,6 +1037,8 @@ function buildExtractionObservability({
   files,
   tools,
   metaOnly,
+  continuity,
+  stageTrace,
 }) {
   const weakSignals = [];
   if (metaOnly) weakSignals.push('metadata-only cursor session');
@@ -776,6 +1050,8 @@ function buildExtractionObservability({
     weakSignals.push('thin technical context');
   }
   if (truncated) weakSignals.push('truncated input');
+  if (continuity?.blocked) weakSignals.push('blocked work thread');
+  if (continuity?.unfinished && !continuity?.blocked) weakSignals.push('unfinished follow-up');
 
   return {
     source,
@@ -791,6 +1067,14 @@ function buildExtractionObservability({
     urlCount: urls.length,
     fileCount: files.length,
     toolCount: tools.length,
+    continuity,
+    stageTrace: (stageTrace || []).map((event) => ({
+      stage: event.stage,
+      progress: event.progress,
+      label: event.label,
+      detail: event.detail,
+      quality: event.quality,
+    })),
     weakSignals,
   };
 }
@@ -1398,6 +1682,7 @@ function sessionTier(score) {
 
 module.exports = {
   extract,
+  extractAsync,
   computeSignalScore,
   computeRecencyBonus,
   classifyDecisionPattern,

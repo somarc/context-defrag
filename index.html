@@ -697,6 +697,7 @@ function buildRealMsgPools() {
   const concepts     = realData.concepts || [];
   const sessions     = realData.sessions || [];
   const weakSessions = realData.observability?.extractionHealth?.weakSessions || [];
+  const continuity   = realData.observability?.continuity || {};
 
   // Augment scan messages with real session titles
   if (sessions.length > 0) {
@@ -719,6 +720,17 @@ function buildRealMsgPools() {
       'Weak extraction: ' + (s.title || s.id || 'session') + ' [' + (s.weakSignals || []).join(', ') + ']'
     );
     MSGS.scan = weakMsgs.concat(MSGS.scan);
+  }
+
+  if (sessions.length > 0) {
+    const continuityMsgs = sessions
+      .filter(s => s.continuity && (s.continuity.resumed || s.continuity.blocked || s.continuity.unfinished))
+      .slice(0, 8)
+      .map(s => {
+        const c = s.continuity || {};
+        return 'State: ' + (s.title || 'session') + ' [' + [c.status, c.phase].filter(Boolean).join(' / ') + ']';
+      });
+    MSGS.scan = continuityMsgs.concat(MSGS.scan);
   }
 
   // Augment defrag messages with real concept writing lines
@@ -1194,6 +1206,7 @@ function showVaultReady() {
   const concepts     = realData.concepts || [];
   const sessions     = realData.sessions || [];
   const extraction   = realData.observability?.extractionHealth || {};
+  const continuity   = realData.observability?.continuity || {};
   const output       = realData.output   || realData.vault || '~/vault';
 
   const sessionCount  = stats.sessions    || stats.conversations || sessions.length || 0;
@@ -1201,6 +1214,9 @@ function showVaultReady() {
   const linkCount     = stats.links       || stats.wikilinks || 0;
   const weakCount     = extraction.weakSessionCount || 0;
   const cursorMeta    = extraction.metadataOnlyCursorSessions || 0;
+  const resumedCount  = continuity.resumedSessions || 0;
+  const blockedCount  = continuity.blockedSessions || 0;
+  const unfinishedCount = continuity.unfinishedSessions || 0;
 
   // Top concepts (up to 5)
   const topConcepts = concepts.slice(0, 5).map(c =>
@@ -1228,6 +1244,9 @@ function showVaultReady() {
     row(pad('Links created:        ', linkCount,    W - 4)),
     row(pad('Weak sessions:        ', weakCount,    W - 4)),
     row(pad('Cursor meta-only:     ', cursorMeta,   W - 4)),
+    row(pad('Resumed threads:      ', resumedCount, W - 4)),
+    row(pad('Blocked threads:      ', blockedCount, W - 4)),
+    row(pad('Open loops:           ', unfinishedCount, W - 4)),
     row(pad('Output: ', output, W - 4)),
     blank,
   ];
