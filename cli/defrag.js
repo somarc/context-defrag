@@ -249,7 +249,7 @@ async function runPipeline(opts) {
   }
 
   // ── Phase: Episode reconstruction ──────────────────────────────────────
-  tui.update({ phase: 'GROUPING', pct: 12 });
+  tui.update({ phase: 'GROUPING', pct: 12, pipeline: { scan: { status: 'done', detail: `${sources.length} srcs` }, group: { status: 'active' } } });
   tui.log(`[EPISODE] Grouping ${sessionsToProcess.length} sessions into episodes...`);
 
   const episodes = groupIntoEpisodes(sessionsToProcess, { verbose: opts.verbose });
@@ -300,7 +300,7 @@ async function runPipeline(opts) {
 
   // ── Phase 3: Extract concepts, decisions, snippets, URLs (10–65%) ──────
   print('Extracting concepts...');
-  tui.update({ phase: 'EXTRACTING', pct: 10 });
+  tui.update({ phase: 'EXTRACTING', pct: 10, pipeline: { group: { status: 'done' }, extract: { status: 'active' } } });
   const extractTimer = stageTimer();
 
   const enriched = [];          // { session, extracted }
@@ -484,7 +484,15 @@ async function runPipeline(opts) {
   tui.log(`[EXTRACT] Signal index built: ${signalIndex.size} concepts`);
   tui.log(extractTimer.end('EXTRACT'));
 
-  tui.update({ phase: 'WRITING', pct: 65, concepts: effectiveConceptCount, currentStage: 'Writing structured vault', currentDetail: '', currentFocus: '', currentQuality: '' });
+  tui.update({
+    phase: 'WRITING', pct: 65, concepts: effectiveConceptCount,
+    currentStage: 'Writing structured vault', currentDetail: '', currentFocus: '', currentQuality: '',
+    pipeline: {
+      extract:  { status: 'done' },
+      index:    { status: 'done', detail: `${signalIndex.size}c` },
+      write:    { status: 'active', sessionsTotal: sessionsToProcess.length, sessionsDone: 0 },
+    },
+  });
   const writeTimer = stageTimer();
   tui.log(`[SCAN] Extracted ${effectiveConceptCount} concept${effectiveConceptCount !== 1 ? 's' : ''}, ${totalSnippets} snippet${totalSnippets !== 1 ? 's' : ''}`);
 
@@ -514,14 +522,25 @@ async function runPipeline(opts) {
       signalIndex,                 // pre-built O(mentions) signal index
       debug: opts.debug,           // --debug: log slow renders to activity log
       onProgress: (msg, stats) => {
-        // Only log non-debug lines to activity (debug lines already loud)
-        if (!msg.startsWith('[DEBUG]') || opts.debug) {
+        // Always emit milestone WRITE lines; suppress per-file paths (handled in logPush)
+        if (msg.startsWith('[DEBUG]')) {
+          if (opts.debug) tui.log(`[DEBUG] ${msg.replace('[DEBUG] ', '')}`);
+        } else {
           tui.log(`[WRITE] ${msg}`);
         }
-        // Update file count every 10 files so TUI reflects progress during session writes
+        // Drive pipeline panel counters
         if (stats.written % 10 === 0) {
           const writePct = 65 + Math.min(20, Math.floor(stats.written / 250));
-          tui.update({ files: stats.written, pct: writePct });
+          tui.update({
+            files: stats.written,
+            pct:   writePct,
+            writeSessions: stats.writeSessions || 0,
+            writeConcepts: stats.writeConcepts || 0,
+            pipeline: {
+              write:    { status: 'active', sessionsDone: stats.writeSessions || stats.written },
+              concepts: { status: stats.writeConcepts > 0 ? 'active' : 'pending', done: stats.writeConcepts || 0 },
+            },
+          });
         }
       },
     });
