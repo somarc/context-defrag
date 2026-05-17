@@ -41,7 +41,7 @@ const DEFAULT_SIGNAL_THRESHOLD = 8;
  * @param {number}  [opts.signalThreshold] - Minimum signal score for a standalone concept note (default: 8)
  * @returns {{ written: number, skipped: number }}
  */
-function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThreshold }) {
+function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThreshold, onProgress }) {
   const stats        = { written: 0, skipped: 0 };
   const threshold    = (typeof signalThreshold === 'number' && isFinite(signalThreshold))
     ? signalThreshold
@@ -63,6 +63,7 @@ function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThresh
     const filePath = path.join(outputDir, 'sessions', fileName);
     const content  = renderSessionNote(session, extracted);
     writeNote(filePath, content, { dryRun, verbose, stats });
+    if (onProgress) onProgress(path.relative(outputDir, filePath), stats);
   }
 
   // ── 2. Concept notes (tiered) ─────────────────────────────────────────────

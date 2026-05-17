@@ -196,9 +196,6 @@ async function runPipeline(opts) {
       if (extracted.concepts.length > 0) {
         print(`  Concepts: ${conceptSample}${morePart}`);
       }
-      if (opts.sources && opts.sources.length <= 1 || opts.verbose) {
-        print(`  Writing: ${opts.output}/sessions/${sessionSlug(session)}`);
-      }
     }
 
     // Accumulate concept frequency for the final summary
@@ -208,9 +205,10 @@ async function runPipeline(opts) {
 
     enriched.push({ session, extracted });
 
-    // Throttle TUI updates to avoid spam on large session sets
-    if (si % 10 === 0 || si === total - 1) {
+    // Yield to event loop every 5 sessions so the TUI render timer can fire
+    if (si % 5 === 0 || si === total - 1) {
       tui.update({ phase: 'EXTRACTING', pct, sessions: si + 1 });
+      await new Promise(resolve => setImmediate(resolve));
     }
   }
 
@@ -244,8 +242,12 @@ async function runPipeline(opts) {
       dryRun:          opts.dryRun,
       verbose:         opts.verbose,
       signalThreshold: opts.minSignal,
-      onProgress: (msg) => {
+      onProgress: (msg, stats) => {
         tui.log(`[WRITE] ${msg}`);
+        // Update file count every 50 writes so TUI stays responsive
+        if (stats.written % 50 === 0) {
+          tui.update({ files: stats.written, pct: 45 + Math.min(24, Math.floor(stats.written / 250)) });
+        }
       },
     });
   } catch (err) {
