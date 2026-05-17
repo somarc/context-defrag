@@ -124,13 +124,14 @@ function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThresh
 // ── Note renderers ────────────────────────────────────────────────────────────
 
 /**
- * Render an upgraded session note with a narrative Summary section.
+ * Render a session note with narrative summary and all available rich metadata.
+ * Codex sessions carry extra fields: skillsUsed, toolCalls, filesTouched,
+ * automations, taskOutcome, cwd, model, originator.
  */
 function renderSessionNote(session, extracted) {
   const date      = isoDate(session.timestamp);
   const isoFull   = session.timestamp.toISOString();
   const sourceTag = session.source;
-  const sessionId = sessionFileName(session).replace('.md', '');
 
   // ── Summary narrative ───────────────────────────────────────────────────
   const narrative = extractSessionNarrative(session, extracted);
@@ -149,8 +150,6 @@ function renderSessionNote(session, extracted) {
   ).join(' · ') || '_None extracted_';
 
   // ── Code snippets ────────────────────────────────────────────────────────
-  // Note: global snippet indices are assigned in the write() loop; here we
-  // emit per-session local indices annotated with lang + a label heuristic.
   const snippetLinks = extracted.snippets.length
     ? extracted.snippets.map((s, i) => {
         const paddedIdx = String(i + 1).padStart(3, '0');
@@ -169,14 +168,82 @@ function renderSessionNote(session, extracted) {
     ? extracted.entities.slice(0, 15).join(', ')
     : '_None detected_';
 
-  // ── Signal score for this session (sum of its concepts' individual scores)
+  // ── Signal score for this session ────────────────────────────────────────
   const sessionSignal = extracted.concepts.reduce((sum, c) => {
-    // Lightweight per-concept score using just this session
     const re = new RegExp(`\\b${escapeRegex(c)}\\b`, 'i');
     const decisions = extracted.decisions.filter((d) => re.test(d)).length;
     const code      = extracted.snippets.filter((s) => s.code && re.test(s.code)).length;
     return sum + decisions * 5 + code * 3;
   }, extracted.concepts.length * 2);
+
+  // ── Build rich Codex metadata sections (only when data exists) ───────────
+  let codexSection = '';
+  if (session.source === 'codex') {
+    const parts = [];
+
+    // Skills used in this session — the most structured signal we have
+    if (session.skillsUsed && session.skillsUsed.length > 0) {
+      const skillLinks = session.skillsUsed
+        .map(s => `[[concepts/${slugify(s)}|${s}]]`)
+        .join(' · ');
+      parts.push(`### Skills Invoked\n${skillLinks}`);
+    }
+
+    // Tool calls — what Codex actually ran
+    if (session.toolCalls && session.toolCalls.length > 0) {
+      const uniqueTools = [...new Set(session.toolCalls.map(t => t.tool))];
+      const toolLines = uniqueTools.map(tool => {
+        const count = session.toolCalls.filter(t => t.tool === tool).length;
+        return `- \`${tool}\`${count > 1 ? ` (×${count})` : ''}`;
+      }).join('\n');
+      parts.push(`### Tools Called\n${toolLines}`);
+    }
+
+    // Files touched — filesystem footprint of this session
+    if (session.filesTouched && session.filesTouched.length > 0) {
+      const fileLines = session.filesTouched
+        .slice(0, 20)
+        .map(f => `- \`${f}\``)
+        .join('\n');
+      parts.push(`### Files Touched\n${fileLines}`);
+    }
+
+    // Automation directives extracted from this session
+    if (session.automations && session.automations.length > 0) {
+      const autoLines = session.automations.map(a => {
+        const attrs = Object.entries(a).map(([k, v]) => `${k}="${v}"`).join(' ');
+        return `- \`::automation-update{${attrs}}\``;
+      }).join('\n');
+      parts.push(`### Automation Directives\n${autoLines}`);
+    }
+
+    // Task outcome
+    if (session.taskOutcome) {
+      const icon = session.taskOutcome === 'complete' ? '✓' : '↻';
+      parts.push(`### Task Outcome\n${icon} ${session.taskOutcome}`);
+    }
+
+    // Project context
+    if (session.cwd) {
+      parts.push(`### Project\n\`${session.cwd}\``);
+    }
+
+    if (parts.length > 0) {
+      codexSection = `\n## Codex Context\n${parts.join('\n\n')}\n`;
+    }
+  }
+
+  // ── Frontmatter extras ────────────────────────────────────────────────────
+  const fmExtras = [];
+  if (session.model)      fmExtras.push(`model: ${session.model}`);
+  if (session.originator) fmExtras.push(`originator: ${session.originator}`);
+  if (session.workspace)  fmExtras.push(`workspace: ${session.workspace}`);
+  if (session.skillsUsed && session.skillsUsed.length > 0) {
+    fmExtras.push(`skills: [${session.skillsUsed.join(', ')}]`);
+  }
+  if (session.taskOutcome) fmExtras.push(`task-outcome: ${session.taskOutcome}`);
+
+  const fmExtrasStr = fmExtras.length ? '\n' + fmExtras.join('\n') : '';
 
   return `---
 title: "${escYaml(session.title)}"
@@ -185,7 +252,7 @@ date: ${isoFull}
 turns: ${session.turnCount}
 signal: ${sessionSignal}
 concepts: ${extracted.concepts.length}
-tags: [session, ${sourceTag}]
+tags: [session, ${sourceTag}]${fmExtrasStr}
 ---
 
 # ${session.title}
@@ -198,7 +265,7 @@ ${decisionsSection}
 
 ## Top Concepts
 ${topConceptLinks}
-
+${codexSection}
 ## Code Snippets
 ${snippetLinks}
 
@@ -343,8 +410,32 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   }
   const signalBreakdown = `s:${_sessionCount} d:${_decisionCount} c:${_codeCount} p:${decisionPatternDiversity} r:${recencyBoost}`;
 
+  // ── Skill provenance — check whether this concept is a known Codex skill ────
+  // Collect all skill descriptions across sessions where this concept is a skill
+  const skillDescriptions = [];
+  const skillSessionSlugs = [];
+  for (const entry of sessionEntries) {
+    if (!entry || !entry.session) continue;
+    const skills  = entry.session.skillsUsed      || [];
+    const avail   = entry.session.skillsAvailable || [];
+    const cLower  = concept.toLowerCase();
+    if (skills.some(s => s.toLowerCase() === cLower)) {
+      const slug = sessionFileName(entry.session).replace('.md', '');
+      skillSessionSlugs.push(`[[sessions/${slug}|${isoDate(entry.session.timestamp)}]]`);
+      // Find the description for this skill from skillsAvailable
+      const def = avail.find(a => a.name && a.name.toLowerCase() === cLower);
+      if (def && def.description && !skillDescriptions.includes(def.description)) {
+        skillDescriptions.push(def.description);
+      }
+    }
+  }
+  const isSkill = skillDescriptions.length > 0 || skillSessionSlugs.length > 0;
+
   // ── Badge line (shown under H1 in promoted notes) ─────────────────────────
   let badgeParts = [];
+  if (isSkill) {
+    badgeParts.push('Codex Skill');
+  }
   if (patternList.length > 0) {
     badgeParts.push(`Decision patterns: ${patternList.join(' · ')}`);
   }
@@ -359,15 +450,20 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   const parts = [];
 
   // Build frontmatter lines, omitting empty optional fields cleanly
+  const tagListWithSkill = isSkill
+    ? tagList.replace('concept', 'concept, skill')
+    : tagList;
+
   const fmLines = [
     `title: "${escYaml(displayName)}"`,
-    `tags: [${tagList}]`,
+    `tags: [${tagListWithSkill}]`,
     `signal: ${score}`,
     `sessions: ${mentionedIn.length}`,
     `decisions: ${conceptDecisions.length}`,
     firstDate ? `first-seen: ${firstDate}` : '',
     lastDate  ? `last-seen: ${lastDate}`   : '',
     `recently-active: ${recentlyActive}`,
+    isSkill ? 'is-skill: true' : '',
     patternList.length > 0
       ? `decision-patterns: [${patternList.join(', ')}]`
       : 'decision-patterns: []',
@@ -378,6 +474,18 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
 
   if (badgeLine) {
     parts.push(badgeLine);
+  }
+
+  if (isSkill) {
+    const skillParts = [];
+    if (skillDescriptions.length > 0) {
+      skillParts.push(skillDescriptions.map(d => `> ${d}`).join('\n'));
+    }
+    if (skillSessionSlugs.length > 0) {
+      const uniqueSlugs = [...new Set(skillSessionSlugs)];
+      skillParts.push(`Invoked in: ${uniqueSlugs.join(', ')}`);
+    }
+    parts.push(`## Skill Definition\n${skillParts.join('\n\n')}\n`);
   }
 
   if (decisionsSection) {

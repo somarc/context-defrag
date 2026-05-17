@@ -131,8 +131,20 @@ const PASCAL_RE = /\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b/g;
 function extract(session) {
   const fullText = session.messages.map((m) => m.content).join('\n\n');
 
+  // Inject skill names as high-frequency terms so they surface as concepts.
+  // Each skill name gets a synthetic concept entry with count = sessions*2
+  // (effectively guaranteed to pass the signal threshold).
+  const extraConcepts = [];
+  if (session.skillsUsed && session.skillsUsed.length > 0) {
+    for (const skill of session.skillsUsed) {
+      extraConcepts.push(skill);
+    }
+  }
+
+  const concepts = extractConcepts(fullText, extraConcepts);
+
   return {
-    concepts:  extractConcepts(fullText),
+    concepts,
     decisions: extractDecisions(session.messages),
     snippets:  extractSnippets(fullText),
     urls:      extractUrls(fullText),
@@ -141,8 +153,28 @@ function extract(session) {
 }
 
 // ── Concepts ─────────────────────────────────────────────────────────────────
-function extractConcepts(text) {
+/**
+ * @param {string}   text          - Full session text
+ * @param {string[]} [seedTerms]   - Pre-identified high-signal terms (e.g. skill names)
+ *                                   that are injected with a high baseline count so they
+ *                                   always pass the frequency filter.
+ */
+function extractConcepts(text, seedTerms = []) {
   const freq  = new Map(); // normalised term → { display, count }
+
+  // 0. Seed terms (e.g. Codex skills) — injected with count 5 so they
+  //    always pass the ≥2 filter and score well in signal computation.
+  for (const term of seedTerms) {
+    if (!term || term.length < 2) continue;
+    const key = term.toLowerCase().trim();
+    if (CONCEPT_STOPWORDS.has(key)) continue;
+    // Use a high baseline count to ensure they surface as concepts
+    if (!freq.has(key)) {
+      freq.set(key, { display: term, count: 5 });
+    } else {
+      freq.get(key).count += 5;
+    }
+  }
 
   // 1. Backtick-wrapped identifiers
   for (const [, term] of text.matchAll(BACKTICK_RE)) {
@@ -174,7 +206,7 @@ function extractConcepts(text) {
     bump(freq, token.toLowerCase(), token);
   }
 
-  // Return concepts that appeared at least twice, sorted by frequency desc
+  // Return concepts that appeared at least twice (or were seeded), sorted by frequency desc
   return [...freq.entries()]
     .filter(([, v]) => v.count >= 2)
     .sort((a, b) => b[1].count - a[1].count)
@@ -416,12 +448,24 @@ function computeSignalScore(concept, sessionItems, allSessions) {
   // allSessions may be omitted for backward compatibility — recencyBonus falls back to 0
   const recencyBoost             = computeRecencyBonus(conceptLower, conceptSessionItems, allSessions || null);
 
+  // Skill bonus: if this concept was explicitly named as a skill in any session,
+  // it's highly structured signal. +6 per session where it was invoked as a skill.
+  let skillBonus = 0;
+  for (const item of conceptSessionItems) {
+    if (!item || !item.session) continue;
+    const skills = item.session.skillsUsed || [];
+    if (skills.some(s => s.toLowerCase() === conceptLower)) {
+      skillBonus += 6;
+    }
+  }
+
   return (sessionCount * 2)
        + (decisionCount * 5)
        + (codeCount * 3)
        + (crossProjectCount * 4)
        + (decisionPatternDiversity * 2)
-       + recencyBoost;
+       + recencyBoost
+       + skillBonus;
 }
 
 // ── Concept decision attribution ──────────────────────────────────────────────
