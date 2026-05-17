@@ -241,6 +241,11 @@ const _anim = {
 let _lastFrameTime = Date.now();
 let _frameLag      = 0;         // ms since last successful frame render
 
+// ── CPU usage tracking ────────────────────────────────────────────────────────
+let _lastCpuUsage  = process.cpuUsage();
+let _lastCpuWall   = Date.now();
+let _cpuPct        = 0;         // rolling CPU % for the process (0–100+)
+
 // ── Render loop ───────────────────────────────────────────────────────────────
 let _renderInterval = null;
 const FRAME_MS = 80;
@@ -266,6 +271,18 @@ function frame() {
   const now = Date.now();
   _frameLag      = now - _lastFrameTime;
   _lastFrameTime = now;
+
+  // Sample CPU usage — rolling % over the last frame interval
+  const cpuNow  = process.cpuUsage();
+  const wallMs  = Math.max(1, now - _lastCpuWall);
+  const userUs  = cpuNow.user  - _lastCpuUsage.user;
+  const sysUs   = cpuNow.system - _lastCpuUsage.system;
+  // CPU % = (user + sys microseconds) / (wall microseconds) * 100
+  // Smooth with 70/30 weighted average to avoid single-frame spikes
+  const sample  = Math.round(((userUs + sysUs) / (wallMs * 1000)) * 100);
+  _cpuPct       = Math.round(_cpuPct * 0.7 + sample * 0.3);
+  _lastCpuUsage = cpuNow;
+  _lastCpuWall  = now;
 
   const { cols, rows } = termSize();
 
@@ -427,11 +444,27 @@ function renderHeader(cols, innerW) {
     }
   }
 
-  const title = `${style.bold}${fg.brightWhite}CTXDEFRAG.EXE${style.reset}  ${spinner} ${phase}${lagStr}`;
+  // CPU usage indicator — always visible, color-coded by load
+  let cpuStr = '';
+  let cpuPlain = '';
+  if (!isDone) {
+    const pct = _cpuPct;
+    const cpuLabel = `  CPU ${pct}%`;
+    if (pct >= 80) {
+      cpuStr   = `  ${fg.brightRed}${style.bold}CPU ${pct}%${style.reset}`;
+    } else if (pct >= 40) {
+      cpuStr   = `  ${fg.brightYellow}CPU ${pct}%${style.reset}`;
+    } else {
+      cpuStr   = `  ${fg.brightBlack}CPU ${pct}%${style.reset}`;
+    }
+    cpuPlain = cpuLabel;
+  }
+
+  const title = `${style.bold}${fg.brightWhite}CTXDEFRAG.EXE${style.reset}  ${spinner} ${phase}${lagStr}${cpuStr}`;
   const right = `${fg.brightBlack}v${VERSION}  [ESC quit]${style.reset}`;
 
   // Plain lengths for padding calc
-  const titlePlain = `CTXDEFRAG.EXE  ${spinFrame} ${_state.phase}${lagPlain}`;
+  const titlePlain = `CTXDEFRAG.EXE  ${spinFrame} ${_state.phase}${lagPlain}${cpuPlain}`;
   const rightLen   = `v${VERSION}  [ESC quit]`.length;
   const midPad     = innerW - titlePlain.length - rightLen;
   const mid        = ' '.repeat(Math.max(1, midPad));
