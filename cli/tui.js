@@ -215,6 +215,7 @@ const _state = {
   startTime:  0,          // Bug 5: set in init(), not at module load time
   lastUpdate: Date.now(),
   done:       false,
+  currentSession: '',    // e.g. "[42/544] codex 2026-05-14" — shown during extraction
   // Session tier tracking
   tiersHigh:     0,
   tiersMedium:   0,
@@ -543,9 +544,16 @@ function renderFooter(cols, innerW) {
   const elapsed = elapsedStr();
   const phase   = _state.phase;
 
-  // Progress bar
-  const barLabel    = `${fg.brightCyan}${style.bold}${phase.padEnd(12)}${style.reset}`;
-  const barLabelLen = phase.length + 1;  // +1 space
+  // Progress bar label — show current session during extraction for liveness
+  let labelText = phase;
+  let labelPlainLen = phase.length;
+  if (phase === 'EXTRACTING' && _state.currentSession) {
+    labelText = _state.currentSession;
+    labelPlainLen = _state.currentSession.length;
+  }
+
+  const barLabel    = `${fg.brightCyan}${style.bold}${labelText}${style.reset}`;
+  const barLabelLen = labelPlainLen + 1;  // +1 space
 
   const pctStr   = `${String(_state.pct).padStart(3)}%`;
   // pct string + space + label + margins
@@ -743,6 +751,8 @@ function update(patch) {
       }
     }
   }
+
+  if (patch.currentSession !== undefined) _state.currentSession = patch.currentSession;
 
   // Tier counts and completion stats
   if (patch.tiersHigh   !== undefined) _state.tiersHigh   = patch.tiersHigh;

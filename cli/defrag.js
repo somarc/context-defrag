@@ -222,7 +222,16 @@ async function runPipeline(opts) {
   let tierCounts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
 
   for (let si = 0; si < total; si++) {
-    const session   = dedupedSessions[si];
+    const session = dedupedSessions[si];
+
+    // ── Pre-extraction: show what we're working on BEFORE the blocking call ─
+    const pctPre = 10 + Math.floor((si / total) * 55);
+    tui.update({
+      phase: 'EXTRACTING', pct: pctPre, sessions: si,
+      currentSession: `[${si + 1}/${total}] ${session.source} ${isoDate(session.timestamp)}`,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
     const extracted = extract(session);
 
     // ── Compute session signal score and tier ───────────────────────────
