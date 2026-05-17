@@ -51,10 +51,22 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
   // Falls back to the sessions array itself for backward compatibility.
   const fullSessions = Array.isArray(allSessions) ? allSessions : sessions;
 
+  // Fresh vault detection — if sessions/ dir doesn't exist yet, skip idempotency
+  // reads entirely (no files to compare against). This eliminates the 380×
+  // synchronous readFileSync calls that blocked the event loop on re-runs.
+  const sessionsDir = path.join(outputDir, 'sessions');
+  const isFreshVault = !fs.existsSync(sessionsDir);
+  const skipIdempotency = isFreshVault;
+  if (onProgress) {
+    onProgress(isFreshVault
+      ? '[WRITE] Fresh vault — skipping idempotency reads'
+      : '[WRITE] Re-run detected — idempotency checks active (user edits preserved)', stats);
+  }
+
   if (!dryRun) {
     ensureDir(outputDir);
     ensureDir(path.join(outputDir, 'concepts'));
-    ensureDir(path.join(outputDir, 'sessions'));
+    ensureDir(sessionsDir);
     ensureDir(path.join(outputDir, 'code'));
   }
 
@@ -71,7 +83,7 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
     const fileName = sessionFileName(session);
     const filePath = path.join(outputDir, 'sessions', fileName);
     const content  = renderSessionNote(session, extracted);
-    writeNote(filePath, content, { dryRun, verbose, stats });
+    writeNote(filePath, content, { dryRun, verbose, stats, skipIdempotency });
 
     if (debug) {
       const ms = Date.now() - t0;
@@ -109,7 +121,7 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
       const filePath = path.join(outputDir, 'concepts', fileName);
       const t0 = debug ? Date.now() : 0;
       const content  = renderConceptNote(concept, mentionedIn, sessions, score, fullSessions, prebuilt);
-      writeNote(filePath, content, { dryRun, verbose, stats });
+      writeNote(filePath, content, { dryRun, verbose, stats, skipIdempotency });
       if (debug) {
         const ms = Date.now() - t0;
         if (ms > 30) {
@@ -125,7 +137,7 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
 
   // ── 3. _low-signal.md ────────────────────────────────────────────────────
   const lowSignalContent = renderLowSignalNote(lowSignalConcepts);
-  writeNote(path.join(outputDir, '_low-signal.md'), lowSignalContent, { dryRun, verbose, stats });
+  writeNote(path.join(outputDir, '_low-signal.md'), lowSignalContent, { dryRun, verbose, stats, skipIdempotency });
 
   // ── 4. Code snippet notes ────────────────────────────────────────────────
   let snippetIndex = 1;
@@ -136,7 +148,7 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
       const fileName  = `snippet-${paddedIdx}.md`;
       const filePath  = path.join(outputDir, 'code', fileName);
       const content   = renderSnippetNote(snippet, snippetIndex, session);
-      writeNote(filePath, content, { dryRun, verbose, stats });
+      writeNote(filePath, content, { dryRun, verbose, stats, skipIdempotency });
       snippetIndex++;
     }
   }
@@ -146,15 +158,15 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
     extracted.urls.map((url) => ({ url, session }))
   );
   const linksContent = renderLinksNote(allUrls);
-  writeNote(path.join(outputDir, 'links.md'), linksContent, { dryRun, verbose, stats });
+  writeNote(path.join(outputDir, 'links.md'), linksContent, { dryRun, verbose, stats, skipIdempotency });
 
   // ── 6. Timeline ──────────────────────────────────────────────────────────
   const timelineContent = renderTimeline(sessions);
-  writeNote(path.join(outputDir, '_timeline.md'), timelineContent, { dryRun, verbose, stats });
+  writeNote(path.join(outputDir, '_timeline.md'), timelineContent, { dryRun, verbose, stats, skipIdempotency });
 
   // ── 7. Root index ────────────────────────────────────────────────────────
   const indexContent = renderIndex(sessions, conceptMap);
-  writeNote(path.join(outputDir, '_index.md'), indexContent, { dryRun, verbose, stats });
+  writeNote(path.join(outputDir, '_index.md'), indexContent, { dryRun, verbose, stats, skipIdempotency });
 
   return stats;
 }
@@ -1141,15 +1153,17 @@ function deriveSnippetLabel(code) {
 
 // ── File system utilities ────────────────────────────────────────────────────
 
-function writeNote(filePath, content, { dryRun, verbose, stats }) {
+function writeNote(filePath, content, { dryRun, verbose, stats, skipIdempotency }) {
   if (dryRun) {
     if (verbose) console.log(`  [DRY] Would write: ${filePath}`);
     stats.written++;
     return;
   }
 
-  // Idempotent: only write if content changed
-  if (fs.existsSync(filePath)) {
+  // Idempotency check — reads the existing file to preserve user edits below
+  // <!-- defrag:end --> and skip unchanged files. Skip on fresh runs to avoid
+  // blocking synchronous reads across hundreds of pre-existing files.
+  if (!skipIdempotency && fs.existsSync(filePath)) {
     const existing = fs.readFileSync(filePath, 'utf8');
 
     // Preserve anything the user wrote after <!-- defrag:end -->
