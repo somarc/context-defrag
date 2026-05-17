@@ -93,6 +93,10 @@ const CONCEPT_STOPWORDS = new Set([
   // Codex/Claude injection artifacts — skill filenames, system context fragments
   'skill.md','agents.md','claude.md','readme.md','contributing.md','license.md',
   'package.json','tsconfig','eslintrc','gitignore','env',
+  // Codex tool names — appear in every agentic session, zero concept signal
+  'exec_command','read_file','write_file','delete_file','create_file',
+  'bash','grep','find','sed','awk','cat','ls','cd','mv','cp','rm','mkdir',
+  'shell','terminal','command','run','execute','invoke',
   // Generic coding noise
   'todo','fixme','hack','workaround','temp','tmp','wip','n/a','tbd','tbc',
   // Single-char and near-empty
