@@ -154,11 +154,26 @@ function initGrid(cols) {
 // ── Log buffer ────────────────────────────────────────────────────────────────
 const LOG_LINES    = 6;    // visible lines
 const _logBuffer   = [];   // newest at end
+let   _lastLogTime = Date.now();
 
 function logPush(entry) {
   // entry: { type, text, time }
   _logBuffer.push(entry);
+  _lastLogTime = Date.now();
   if (_logBuffer.length > 40) _logBuffer.shift();
+}
+
+// Heartbeat: synthetic pulse line injected when no activity for >2.5s
+function maybeHeartbeat() {
+  if (_state.phase === 'COMPLETE') return;
+  const silent = Date.now() - _lastLogTime;
+  if (silent > 2500) {
+    const dots = ['   ', '.  ', '.. ', '...'][Math.floor(Date.now() / 400) % 4];
+    const msg  = `${fg.brightBlack}working${dots}${style.reset}`;
+    // Don't push to buffer — just render as a temporary overlay in renderLog
+    return msg;
+  }
+  return null;
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -334,16 +349,28 @@ function tickAnimations() {
 
 // ── Section renderers ─────────────────────────────────────────────────────────
 
+// Braille spinner frames — smooth and modern, reads instantly as "working"
+const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+
 function renderHeader(cols, innerW) {
   const VERSION = '1.0';
-  const title   = `${style.bold}${fg.brightWhite}CTXDEFRAG.EXE${style.reset}`;
-  const right   = `${fg.brightBlack}v${VERSION}  [ESC quit]${style.reset}`;
 
-  // Lengths without ANSI escapes
-  const titleLen = 'CTXDEFRAG.EXE'.length;
-  const rightLen = `v${VERSION}  [ESC quit]`.length;
-  const midPad   = innerW - titleLen - rightLen;
-  const mid      = ' '.repeat(Math.max(1, midPad));
+  // Spinner: only show when actively processing (not complete)
+  const isDone = _state.phase === 'COMPLETE';
+  const spinFrame = SPINNER_FRAMES[Math.floor(Date.now() / 80) % SPINNER_FRAMES.length];
+  const spinner = isDone
+    ? `${fg.brightGreen}✓${style.reset}`
+    : `${fg.brightCyan}${spinFrame}${style.reset}`;
+
+  const phase = `${fg.brightCyan}${style.bold}${_state.phase}${style.reset}`;
+  const title = `${style.bold}${fg.brightWhite}CTXDEFRAG.EXE${style.reset}  ${spinner} ${phase}`;
+  const right = `${fg.brightBlack}v${VERSION}  [ESC quit]${style.reset}`;
+
+  // Plain lengths for padding calc
+  const titlePlain = `CTXDEFRAG.EXE  ${spinFrame} ${_state.phase}`;
+  const rightLen   = `v${VERSION}  [ESC quit]`.length;
+  const midPad     = innerW - titlePlain.length - rightLen;
+  const mid        = ' '.repeat(Math.max(1, midPad));
 
   let s = '';
   s += hLine('top', cols);
@@ -418,22 +445,28 @@ function renderLog(cols, innerW) {
   let s = '';
   s += `│ ${topBorder} │\n`;
 
-  const entries = _logBuffer.slice(-LOG_LINES);
+  const heartbeat   = maybeHeartbeat();
+  const entries     = _logBuffer.slice(-LOG_LINES);
   while (entries.length < LOG_LINES) entries.unshift(null);
 
   const recencyCount = entries.filter(Boolean).length;
 
   entries.forEach((entry, i) => {
-    const lineContent = entry ? formatLogEntry(entry) : '';
-    const plainLen    = entry ? plainLength(lineContent) : 0;
+    const isLastSlot  = i === LOG_LINES - 1;
+    // If silent, replace the last (most recent) slot with heartbeat pulse
+    const lineContent = (isLastSlot && heartbeat && !entry)
+      ? heartbeat
+      : entry ? formatLogEntry(entry) : '';
+    const plainLen    = (isLastSlot && heartbeat && !entry)
+      ? plainLength(heartbeat)
+      : entry ? plainLength(formatLogEntry(entry)) : 0;
     const pad         = ' '.repeat(Math.max(0, contentW - plainLen));
 
-    // Age: 0 = most recent, higher = older
     const entryIndex  = entries.slice(0, i + 1).filter(Boolean).length - (entry ? 1 : 0);
     const age         = recencyCount - 1 - entryIndex;
     const isDim       = !entry || age > 1;
-    const dimOn       = isDim ? style.dim : '';
-    const dimOff      = isDim ? style.reset : '';
+    const dimOn       = isDim && !heartbeat ? style.dim : '';
+    const dimOff      = isDim && !heartbeat ? style.reset : '';
 
     s += `│ │ ${dimOn}${lineContent}${pad}${dimOff} │ │\n`;
   });
