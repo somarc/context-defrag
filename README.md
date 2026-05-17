@@ -14,13 +14,13 @@
 ║   ██████╔╝███████╗██║     ██║  ██║██║  ██║╚██████╔╝              ║
 ║   ╚═════╝ ╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝               ║
 ╠═══════════════════════════════════════════════════════════════════╣
-║  Definitely Not Microsoft(R) Context Defragmenter   Version 1.0  ║
+║  Sloprosoft Context Defragmenter                 Version 1.0       ║
 ║  Copyright (C) context-defrag contributors, 2026.                 ║
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
-> *"Every time you explain your architecture to Claude, that knowledge dies*
-> *when the context window closes. context-defrag fixes that."*
+> *"Every time you explain your architecture to an LLM, agent, or coding harness,*
+> *that knowledge dies when the context window closes. context-defrag fixes that."*
 
 ---
 
@@ -129,11 +129,11 @@ The demo is an interactive HTML recreation of the defrag UI — blocks ticking a
 
 ### About the visualizer
 
-The terminal UI is a faithful recreation of the MS-DOS 6.x Disk Defragmenter, rendered live as your context is processed.
+The terminal UI is a faithful recreation of a DOS-era disk defragmenter, rendered live as your context is processed.
 
 ```
   ╔══════════════════════════════════════════════════════════════╗
-  ║  Definitely Not Microsoft(R) Context Defragmenter            ║
+  ║  Sloprosoft Context Defragmenter                             ║
   ╠══════════════════════════════════════════════════════════════╣
   ║                                                              ║
   ║  ████████████████████████▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  ║
