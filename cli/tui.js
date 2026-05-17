@@ -233,6 +233,10 @@ const _anim = {
   doneSweeping:    false,
 };
 
+// ── Event loop health tracking ────────────────────────────────────────────────
+let _lastFrameTime = Date.now();
+let _frameLag      = 0;         // ms since last successful frame render
+
 // ── Render loop ───────────────────────────────────────────────────────────────
 let _renderInterval = null;
 const FRAME_MS = 80;
@@ -254,6 +258,11 @@ let _lastCols = 0;
 let _lastRows = 0;
 
 function frame() {
+  // Track event loop health
+  const now = Date.now();
+  _frameLag      = now - _lastFrameTime;
+  _lastFrameTime = now;
+
   const { cols, rows } = termSize();
 
   // If terminal resized, clear and redraw everything
@@ -394,15 +403,31 @@ function renderHeader(cols, innerW) {
   const isDone = _state.phase === 'COMPLETE';
   const spinFrame = SPINNER_FRAMES[Math.floor(Date.now() / 80) % SPINNER_FRAMES.length];
   const spinner = isDone
-    ? `${fg.brightGreen}✓${style.reset}`
+    ? `${fg.brightGreen}\u2713${style.reset}`
     : `${fg.brightCyan}${spinFrame}${style.reset}`;
 
   const phase = `${fg.brightCyan}${style.bold}${_state.phase}${style.reset}`;
-  const title = `${style.bold}${fg.brightWhite}CTXDEFRAG.EXE${style.reset}  ${spinner} ${phase}`;
+
+  // Event loop health indicator — shows lag when the loop is stalled
+  let lagStr = '';
+  let lagPlain = '';
+  if (!isDone && _frameLag > 200) {
+    // Show lag when > 200ms (normal is ~80ms)
+    const lagMs = Math.round(_frameLag);
+    if (lagMs >= 2000) {
+      lagStr     = `  ${fg.brightRed}${style.bold}IO ${(lagMs / 1000).toFixed(1)}s${style.reset}`;
+      lagPlain   = `  IO ${(lagMs / 1000).toFixed(1)}s`;
+    } else {
+      lagStr     = `  ${fg.brightYellow}IO ${lagMs}ms${style.reset}`;
+      lagPlain   = `  IO ${lagMs}ms`;
+    }
+  }
+
+  const title = `${style.bold}${fg.brightWhite}CTXDEFRAG.EXE${style.reset}  ${spinner} ${phase}${lagStr}`;
   const right = `${fg.brightBlack}v${VERSION}  [ESC quit]${style.reset}`;
 
   // Plain lengths for padding calc
-  const titlePlain = `CTXDEFRAG.EXE  ${spinFrame} ${_state.phase}`;
+  const titlePlain = `CTXDEFRAG.EXE  ${spinFrame} ${_state.phase}${lagPlain}`;
   const rightLen   = `v${VERSION}  [ESC quit]`.length;
   const midPad     = innerW - titlePlain.length - rightLen;
   const mid        = ' '.repeat(Math.max(1, midPad));
