@@ -1364,3 +1364,124 @@ Three lists in `extractor.js` control what gets extracted and how:
 2. Add `'lowercase': 'DisplayForm'` to `KEYWORD_DISPLAY`. Without a display entry, the term will appear lowercased in concept notes (e.g., `mytech` instead of `MyTech`).
 
 Note that `TECH_KEYWORDS` matches exact word boundaries — adding `'nextjs'` matches "nextjs" but not "next.js". The display entry `'nextjs': 'Next.js'` handles the display form. If your technology name contains punctuation, add both the sanitized form (for matching) and ensure the display form is set.
+
+---
+
+## 15. ETL Spine (v2 target)
+
+The existing pipeline (Sections 1–14) is a **batch text pipeline**: mine → extract → write. It is fast, self-contained, and correct. Its architectural ceiling is that every run re-processes the full corpus: there is no incremental invalidation, no stable relational store, and no separation between what changed and what must be re-rendered.
+
+The ETL spine introduces a new layer of infrastructure **underneath** the existing pipeline. It does not replace it — it gives it a durable canonical foundation for incremental operation at scale.
+
+### 15.1 The 4-layer model
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Layer 1 — Discovery                                                 │
+│  Scan source roots. Fingerprint each artifact (mtime + size + SHA-  │
+│  256 of first 1 MB). Upsert into artifacts table. Emit WorkManifest.│
+│                                                                      │
+│  Files: cli/db/discovery.js, cli/db/fingerprint.js                  │
+│  Entry:  node cli/sync.js                                            │
+└──────────────────────────┬───────────────────────────────────────────┘
+                            │ WorkManifest (new | changed artifacts only)
+┌──────────────────────────▼───────────────────────────────────────────┐
+│  Layer 2 — Normalization  (Phase 1)                                  │
+│  For each changed artifact, run the appropriate miner adapter.       │
+│  Produce threads + messages rows in the canonical store.             │
+│  Unchanged artifacts are skipped — this is where incremental wins.  │
+│                                                                      │
+│  Tables: threads, messages, episodes                                 │
+│  Future: cli/db/adapters/{claude,codex,cursor}.js                   │
+└──────────────────────────┬───────────────────────────────────────────┘
+                            │ Thread IDs with new/changed content
+┌──────────────────────────▼───────────────────────────────────────────┐
+│  Layer 3 — Extraction / Linking  (Phase 2)                           │
+│  Run heuristic extraction on changed threads only.                   │
+│  Accumulate concept scores, decisions, snippets into the DB.         │
+│  Episode grouping: cluster threads by workspace + time proximity.    │
+│                                                                      │
+│  Tables: (concept_scores, episode_concepts — Phase 2 additions)     │
+│  Future: worker pool for parallel extraction across threads          │
+└──────────────────────────┬───────────────────────────────────────────┘
+                            │ Concept/episode diffs
+┌──────────────────────────▼───────────────────────────────────────────┐
+│  Layer 4 — Materialization  (Phase 3)                                │
+│  Project DB state into vault files.                                  │
+│  Compare content_hash of each note against render_state.             │
+│  Only write files whose hash has changed. Skip unchanged notes.      │
+│  Update render_state on each write.                                  │
+│                                                                      │
+│  Tables: render_state                                                │
+│  Future: cli/db/projector.js (smart projector)                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 Why SQLite + WAL
+
+SQLite in WAL (Write-Ahead Logging) mode provides exactly what the ETL spine needs:
+
+**Incremental invalidation via content hashing.** The `artifacts.content_hash` field (SHA-256 of first 1 MB) answers "did this file change?" in O(1) after the first scan. Re-running `sync.js` on an unchanged corpus costs one `stat()` + one DB read per file — no file parsing, no extraction, no vault writes. This is why a second run of `sync.js` shows all artifacts as "unchanged".
+
+**Stable IDs for downstream invalidation.** Every artifact, thread, episode, and rendered note has a stable integer primary key. When an artifact changes, its threads are marked stale, which marks their episodes stale, which invalidates the concept scores built from those episodes, which marks their render_state rows stale. The chain is explicit in the foreign key graph — no guesswork about what to re-render.
+
+**No write amplification.** The `render_state` table tracks the `content_hash` of every written vault file. If a concept's signal score didn't change between runs, the hash of the note it would produce doesn't change, and the file is skipped. For large, stable vaults (majority of sessions unchanged) this cuts I/O dramatically.
+
+**Zero infrastructure.** SQLite is a single file. No server, no port, no connection pool, no migrations service. `defrag.db` lives next to the vault and can be deleted and rebuilt from scratch at any time. The vault is always the authoritative output; the DB is always a derived cache.
+
+**WAL specifically.** WAL mode allows readers and the single writer to proceed without blocking each other. `sync.js` can read manifest data while `defrag.js` is writing thread rows. This matters in watch mode where both processes may be active simultaneously.
+
+### 15.3 Phase roadmap
+
+| Phase | Status | Deliverables |
+|-------|--------|-------------|
+| **Phase 0** | ✅ Complete | Schema v1, fingerprint utilities, discovery runner, `sync.js`, `defrag.js --db` bridge |
+| **Phase 1** | Planned | Normalization adapters (claude/codex/cursor → threads + messages), episode grouping by workspace + time, `sync.js --normalize` flag |
+| **Phase 2** | Planned | Chunked extraction worker pool, concept_scores table, incremental signal recomputation (only changed threads), `sync.js --extract` flag |
+| **Phase 3** | Planned | Smart projector: `render_state`-aware vault writer that only re-renders changed notes, `sync.js --materialize` flag, full pipeline as `sync.js --all` |
+
+After Phase 3, `sync.js --all` replaces `defrag.js` for incremental use cases while `defrag.js` remains available as the zero-setup batch path.
+
+### 15.4 Fingerprint invalidation chain
+
+Changes propagate downward through the layer graph. The chain is:
+
+```
+artifact.content_hash changed
+    → artifact row updated (changed=true in WorkManifest)
+        → threads for this artifact are stale (need re-normalization)
+            → episodes containing those threads are stale
+                → concept scores built from those episodes are stale
+                    → render_state rows for notes derived from those concepts are stale
+                        → vault files are re-written
+                            → render_state.content_hash updated
+```
+
+The key insight: if a thread's content is unchanged (same artifact hash, same parsed messages), nothing downstream of it needs to rerun. Only actual changes propagate.
+
+**render_state as the write gate.** Before writing any vault file, the projector computes the note's content string and hashes it. If the hash matches `render_state.content_hash`, the file write is skipped. This means even if the extraction phase re-ran (e.g. due to a code change in `extractor.js`), notes whose content did not meaningfully change are not re-written to disk.
+
+### 15.5 Non-goals for v2
+
+The following are explicitly out of scope for the ETL spine. They are documented here to prevent scope creep in Phase 1–3 PRs.
+
+**No DuckDB.** DuckDB is excellent for analytical queries over large datasets but requires native compilation (same problem as `better-sqlite3`). SQLite is sufficient for the row counts involved (hundreds of thousands of messages at most) and requires zero installation. If query performance becomes a bottleneck, the correct path is adding indexes to the existing schema, not migrating storage engines.
+
+**No cloud sync.** The canonical store is a local file. The tool is privacy-first — conversation history never leaves the machine. Cloud sync would require encryption, access control, sync conflict resolution, and a backend. None of these are in scope. Users who want multi-machine sync can put `defrag.db` in their Dropbox or iCloud Drive folder.
+
+**No embeddings / vector search.** Semantic search is QMD's job (see Section 13). The ETL spine does not generate or store embeddings. Adding vector search to SQLite (via sqlite-vec or similar) would re-introduce native compilation dependencies. The clean separation of concerns is: DB = structured store, QMD = semantic layer.
+
+**No daemon / background process.** `sync.js` is a foreground CLI command. It does not install a file watcher service, a launchd plist, or a cron job. Users who want continuous sync can use `defrag.js --watch` (existing) or configure their own cron via `crontask` (SLICC) or system-level scheduling.
+
+**No multi-user / team mode.** The tool is designed for a single user's local LLM conversation history. Collaborative vaults, shared databases, and team knowledge bases are out of scope.
+
+### 15.6 The `--db` bridge in defrag.js
+
+The `--db <path>` flag on the existing `defrag.js` pipeline is a minimal one-way bridge introduced in Phase 0. When passed:
+
+1. After vault write completes, `bridgeToDb()` is called with all enriched sessions.
+2. For each session, source, artifact, and thread rows are upserted into the DB using the session's existing `id` as `thread_key`. This preserves ID stability — the same FNV-1a hash the pipeline has always used becomes the thread's canonical external ID in the DB.
+3. `render_state` rows are written for each vault file that was produced, if `writeStats.writtenPaths` is populated by the writer.
+4. The bridge logs `[DB] Wrote N threads, N render_state rows to defrag.db`.
+
+Without `--db`, the pipeline is byte-for-byte identical to its pre-spine behaviour. The bridge is purely additive.
