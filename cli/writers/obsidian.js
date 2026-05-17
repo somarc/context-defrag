@@ -79,18 +79,39 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
       await new Promise(r => setImmediate(r));
     }
 
-    const t0 = debug ? Date.now() : 0;
+    const t0 = Date.now();
     const fileName = sessionFileName(session);
     const filePath = path.join(outputDir, 'sessions', fileName);
-    const content  = renderSessionNote(session, extracted);
+
+    let content;
+    try {
+      content = renderSessionNote(session, extracted);
+    } catch (err) {
+      content = `---\ntitle: "${(session.title || 'Error').replace(/"/g, '\\"')}"\nsource: ${session.source}\ndate: ${session.timestamp ? session.timestamp.toISOString() : ''}\nerror: render-failed\n---\n\n> Render failed: ${err.message}\n\n<!-- defrag:end -->\n`;
+      if (onProgress) onProgress(`[WARN] render error for ${path.basename(filePath)}: ${err.message}`, stats);
+    }
+
+    // Hard cap: if content exceeds 500KB the fs.writeFileSync itself becomes slow
+    // and subsequent string operations on the content block the event loop.
+    const MAX_NOTE_BYTES = 512 * 1024;
+    if (Buffer.byteLength(content, 'utf8') > MAX_NOTE_BYTES) {
+      const truncMsg = `\n\n> ⚠️ Note truncated — original render exceeded 500 KB (${session.turnCount} turns). See source file for full content.\n\n<!-- defrag:end -->\n`;
+      const sentinel = '<!-- defrag:end -->';
+      const sentinelIdx = content.indexOf(sentinel);
+      if (sentinelIdx > 0) {
+        content = content.slice(0, Math.min(sentinelIdx, MAX_NOTE_BYTES - truncMsg.length)) + truncMsg;
+      } else {
+        content = content.slice(0, MAX_NOTE_BYTES - truncMsg.length) + truncMsg;
+      }
+      if (onProgress) onProgress(`[WARN] truncated oversized note: ${path.basename(filePath)} (${session.turnCount} turns)`, stats);
+    }
+
     writeNote(filePath, content, { dryRun, verbose, stats, skipIdempotency });
 
-    if (debug) {
-      const ms = Date.now() - t0;
-      if (ms > 50) {
-        // Slow session — log it
-        if (onProgress) onProgress(`[DEBUG] slow session render: ${ms}ms — ${path.basename(filePath)}`, stats);
-      }
+    const ms = Date.now() - t0;
+    if (ms > 200 || debug) {
+      // Always log slow renders (>200ms) — these are the stall candidates
+      if (onProgress) onProgress(`[DEBUG] slow session: ${ms}ms — ${path.basename(filePath)} (${session.turnCount} turns, ${session.source})`, stats);
     }
 
     if (onProgress) onProgress(path.relative(outputDir, filePath), stats);
@@ -122,11 +143,9 @@ async function write({ outputDir, sessions, allSessions, dryRun, verbose, signal
       const t0 = debug ? Date.now() : 0;
       const content  = renderConceptNote(concept, mentionedIn, sessions, score, fullSessions, prebuilt);
       writeNote(filePath, content, { dryRun, verbose, stats, skipIdempotency });
-      if (debug) {
-        const ms = Date.now() - t0;
-        if (ms > 30) {
-          if (onProgress) onProgress(`[DEBUG] slow concept render: ${ms}ms — ${concept}`, stats);
-        }
+      const ms = Date.now() - t0;
+      if (ms > 100 || debug) {
+        if (onProgress) onProgress(`[DEBUG] slow concept: ${ms}ms — ${concept}`, stats);
       }
       stats.promoted++;
     } else {
