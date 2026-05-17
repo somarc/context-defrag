@@ -96,6 +96,7 @@ function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThresh
   let snippetIndex = 1;
   for (const { session, extracted } of sessions) {
     for (const snippet of extracted.snippets) {
+      snippet._globalIndex = snippetIndex;
       const paddedIdx = String(snippetIndex).padStart(3, '0');
       const fileName  = `snippet-${paddedIdx}.md`;
       const filePath  = path.join(outputDir, 'code', fileName);
@@ -125,6 +126,83 @@ function write({ outputDir, sessions, allSessions, dryRun, verbose, signalThresh
 
 // ── Note renderers ────────────────────────────────────────────────────────────
 
+function getConceptNames(extracted, limit = Infinity) {
+  const names = Array.isArray(extracted?.conceptObjects) && extracted.conceptObjects.length > 0
+    ? extracted.conceptObjects.map((concept) => concept.name)
+    : (extracted?.concepts || []);
+  return names.slice(0, limit);
+}
+
+function getStructuredItems(items, fallback = []) {
+  if (Array.isArray(items) && items.length > 0) return items;
+  return fallback.map((text) => ({ text }));
+}
+
+function renderStructuredList(items, emptyText) {
+  const source = getStructuredItems(items);
+  if (!source.length) return emptyText;
+  return source
+    .slice(0, 10)
+    .map((item) => `- ${item.text || item}`)
+    .join('\n');
+}
+
+function conceptRegex(concept) {
+  const raw = String(concept || '');
+  const escaped = escapeRegex(raw.toLowerCase());
+  return /[.+#/\- ]/.test(raw)
+    ? new RegExp(`(^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, 'i')
+    : new RegExp(`\\b${escaped}\\b`, 'i');
+}
+
+function findConceptRecord(extracted, concept) {
+  const key = String(concept || '').toLowerCase();
+  const conceptObjects = Array.isArray(extracted?.conceptObjects) ? extracted.conceptObjects : [];
+  return conceptObjects.find((item) =>
+    item.key === key ||
+    item.name.toLowerCase() === key ||
+    (item.aliases || []).some((alias) => String(alias).toLowerCase() === key)
+  ) || null;
+}
+
+function aggregateConceptRecord(concept, sessionEntries) {
+  const files = new Set();
+  const tools = new Set();
+  const workspaces = new Set();
+  const aliases = new Set();
+  const sourceTypes = new Set();
+  const related = new Map();
+  let record = null;
+
+  for (const entry of sessionEntries) {
+    const conceptRecord = findConceptRecord(entry.extracted, concept);
+    if (!conceptRecord) continue;
+    record = record || conceptRecord;
+    for (const alias of (conceptRecord.aliases || [])) aliases.add(alias);
+    for (const file of (conceptRecord.files || [])) files.add(file);
+    for (const tool of (conceptRecord.tools || [])) tools.add(tool);
+    for (const workspace of (conceptRecord.workspaces || [])) workspaces.add(workspace);
+    for (const type of (conceptRecord.sourceTypes || [])) sourceTypes.add(type);
+    for (const rel of (conceptRecord.relatedConcepts || [])) {
+      if (!rel || !rel.key || rel.key === concept.toLowerCase()) continue;
+      related.set(rel.key, (related.get(rel.key) || 0) + (rel.count || 1));
+    }
+  }
+
+  return {
+    kind: record?.kind || 'topic',
+    aliases: [...aliases].slice(0, 8),
+    files: [...files].slice(0, 12),
+    tools: [...tools].slice(0, 12),
+    workspaces: [...workspaces].slice(0, 8),
+    sourceTypes: [...sourceTypes].slice(0, 8),
+    related: [...related.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([key]) => key),
+  };
+}
+
 /**
  * Render a session note with content depth determined by session signal tier.
  *
@@ -141,6 +219,11 @@ function renderSessionNote(session, extracted) {
   const sourceTag = session.source;
   const tier      = session._sessionTier  || 'HIGH';
   const sessScore = session._sessionScore || 0;
+  const topConceptNames = getConceptNames(extracted, 12);
+  const decisionItems = getStructuredItems(extracted.decisionItems, extracted.decisions || []);
+  const issueItems    = getStructuredItems(extracted.issues || []);
+  const actionItems   = getStructuredItems(extracted.actionItems || []);
+  const commitItems   = getStructuredItems(extracted.commits || []);
 
   // ── Frontmatter extras (shared across all tiers) ──────────────────────────
   const fmExtras = [];
@@ -152,12 +235,17 @@ function renderSessionNote(session, extracted) {
   if (session.skillsUsed && session.skillsUsed.length > 0) {
     fmExtras.push(`skills: [${session.skillsUsed.join(', ')}]`);
   }
+  if (session.workspacePath) fmExtras.push(`workspace-path: "${escYaml(session.workspacePath)}"`);
+  if (session.cursorFormat)  fmExtras.push(`cursor-format: ${session.cursorFormat}`);
   if (session.taskOutcome) fmExtras.push(`task-outcome: ${session.taskOutcome}`);
+  fmExtras.push(`issues: ${issueItems.length}`);
+  fmExtras.push(`actions: ${actionItems.length}`);
+  fmExtras.push(`commits: ${commitItems.length}`);
   const fmExtrasStr = fmExtras.length ? '\n' + fmExtras.join('\n') : '';
 
   // ── LOW tier: minimal note (~10 lines) ────────────────────────────────────
   if (tier === 'LOW') {
-    const topConcepts = extracted.concepts.slice(0, 3).map((c) =>
+    const topConcepts = topConceptNames.slice(0, 3).map((c) =>
       `[[concepts/${slugify(c)}|${c}]]`
     ).join(' · ') || '_None_';
 
@@ -166,7 +254,7 @@ title: "${escYaml(session.title)}"
 source: ${sourceTag}
 date: ${isoFull}
 turns: ${session.turnCount}
-concepts: ${extracted.concepts.length}
+concepts: ${topConceptNames.length}
 tags: [session, ${sourceTag}, low-signal]${fmExtrasStr}
 ---
 
@@ -189,73 +277,20 @@ ${topConcepts}
     : '';
 
   // Key Decisions
-  const decisionsSection = extracted.decisions.length
-    ? extracted.decisions.map((d) => `- ${d}`).join('\n')
-    : '_None detected_';
+  const decisionsSection = renderStructuredList(decisionItems, '_None detected_');
+  const issuesSection    = renderStructuredList(issueItems, '_None detected_');
+  const actionsSection   = renderStructuredList(actionItems, '_None detected_');
+  const commitsSection   = renderStructuredList(commitItems, '_None detected_');
 
   // Top Concepts — inline pill style
-  const topConceptLinks = extracted.concepts.slice(0, 12).map((c) =>
+  const topConceptLinks = topConceptNames.slice(0, 12).map((c) =>
     `[[concepts/${slugify(c)}|${c}]]`
   ).join(' · ') || '_None extracted_';
 
   // ── Signal score for this session ────────────────────────────────────────
-  const sessionSignal = extracted.concepts.reduce((sum, c) => {
-    const re = new RegExp(`\\b${escapeRegex(c)}\\b`, 'i');
-    const decisions = extracted.decisions.filter((d) => re.test(d)).length;
-    const code      = extracted.snippets.filter((s) => s.code && re.test(s.code)).length;
-    return sum + decisions * 5 + code * 3;
-  }, extracted.concepts.length * 2);
+  const sessionSignal = Math.round(sessScore * 10) / 10;
 
-  // ── MEDIUM tier: focused note ─────────────────────────────────────────────
-  if (tier === 'MEDIUM') {
-    return `---
-title: "${escYaml(session.title)}"
-source: ${sourceTag}
-date: ${isoFull}
-turns: ${session.turnCount}
-signal: ${sessionSignal}
-concepts: ${extracted.concepts.length}
-tags: [session, ${sourceTag}]${fmExtrasStr}
----
-
-# ${session.title}
-
-> Source: **${sourceTag}** | ${date} | ${session.turnCount} turns
-
-${summarySection}
-## Key Decisions
-${decisionsSection}
-
-## Top Concepts
-${topConceptLinks}
-
-<!-- defrag:end -->
-`;
-  }
-
-  // ── HIGH tier: full treatment ─────────────────────────────────────────────
-
-  // Code snippets
-  const snippetLinks = extracted.snippets.length
-    ? extracted.snippets.map((s, i) => {
-        const paddedIdx = String(i + 1).padStart(3, '0');
-        const label     = deriveSnippetLabel(s.code);
-        return `- [[code/snippet-${paddedIdx}]] — ${s.lang || 'text'}${label ? ` — ${label}` : ''}`;
-      }).join('\n')
-    : '_None_';
-
-  // URLs
-  const urlSection = extracted.urls.length
-    ? extracted.urls.slice(0, 20).map((u) => `- ${u}`).join('\n')
-    : '_None_';
-
-  // Technologies Mentioned
-  const entitySection = extracted.entities.length
-    ? extracted.entities.slice(0, 15).join(', ')
-    : '_None detected_';
-
-  // Codex metadata sections (only for codex source)
-  let codexSection = '';
+  let sourceContextSection = '';
   if (session.source === 'codex') {
     const parts = [];
 
@@ -301,17 +336,51 @@ ${topConceptLinks}
     }
 
     if (parts.length > 0) {
-      codexSection = `\n## Codex Context\n${parts.join('\n\n')}\n`;
+      sourceContextSection = `\n## Codex Context\n${parts.join('\n\n')}\n`;
     }
   }
 
-  return `---
+  if (session.source === 'cursor') {
+    const parts = [];
+    if (session.workspacePath || session.workspace) {
+      parts.push(`### Workspace\n\`${session.workspacePath || session.workspace}\``);
+    }
+    if (session.cursorFormat) {
+      parts.push(`### Cursor Storage\n- Format: \`${session.cursorFormat}\`\n- Key: \`${session.cursorChatKey || 'unknown'}\``);
+    }
+    if (session.cursorMetaOnly) {
+      parts.push('### Coverage\n- Metadata-only Cursor session; body transcript was not recoverable from storage.');
+    }
+    if (session.cursorMeta) {
+      const metaLines = [];
+      if (session.cursorMeta.unifiedMode) metaLines.push(`- Mode: \`${session.cursorMeta.unifiedMode}\``);
+      if (session.cursorMeta.forceMode) metaLines.push(`- Force mode: \`${session.cursorMeta.forceMode}\``);
+      if (Number.isFinite(session.cursorMeta.contextUsagePercent)) metaLines.push(`- Context usage: ${session.cursorMeta.contextUsagePercent}%`);
+      if (session.cursorMeta.isWorktree) metaLines.push('- Worktree session');
+      if (session.cursorMeta.isSpec) metaLines.push('- Spec session');
+      if (session.cursorMeta.hasBlockingPendingActions) metaLines.push('- Blocking actions pending');
+      if (metaLines.length > 0) parts.push(`### Composer Metadata\n${metaLines.join('\n')}`);
+    }
+    if ((extracted.files || []).length > 0) {
+      parts.push(`### Files Mentioned\n${extracted.files.slice(0, 15).map((file) => `- \`${file}\``).join('\n')}`);
+    }
+    if ((extracted.tools || []).length > 0) {
+      parts.push(`### Tools Mentioned\n${extracted.tools.slice(0, 15).map((tool) => `- \`${tool}\``).join('\n')}`);
+    }
+    if (parts.length > 0) {
+      sourceContextSection = `\n## Cursor Context\n${parts.join('\n\n')}\n`;
+    }
+  }
+
+  // ── MEDIUM tier: focused note ─────────────────────────────────────────────
+  if (tier === 'MEDIUM') {
+    return `---
 title: "${escYaml(session.title)}"
 source: ${sourceTag}
 date: ${isoFull}
 turns: ${session.turnCount}
 signal: ${sessionSignal}
-concepts: ${extracted.concepts.length}
+concepts: ${topConceptNames.length}
 tags: [session, ${sourceTag}]${fmExtrasStr}
 ---
 
@@ -323,9 +392,70 @@ ${summarySection}
 ## Key Decisions
 ${decisionsSection}
 
+## Key Issues
+${issuesSection}
+
+## Action Items
+${actionsSection}
+
 ## Top Concepts
 ${topConceptLinks}
-${codexSection}
+
+<!-- defrag:end -->
+`;
+  }
+
+  // ── HIGH tier: full treatment ─────────────────────────────────────────────
+
+  // Code snippets
+  const snippetLinks = extracted.snippets.length
+    ? extracted.snippets.map((s, i) => {
+        const paddedIdx = String(s._globalIndex || (i + 1)).padStart(3, '0');
+        const label     = deriveSnippetLabel(s.code);
+        return `- [[code/snippet-${paddedIdx}]] — ${s.lang || 'text'}${label ? ` — ${label}` : ''}`;
+      }).join('\n')
+    : '_None_';
+
+  // URLs
+  const urlSection = extracted.urls.length
+    ? extracted.urls.slice(0, 20).map((u) => `- ${u}`).join('\n')
+    : '_None_';
+
+  // Technologies Mentioned
+  const entitySection = extracted.entities.length
+    ? extracted.entities.slice(0, 15).join(', ')
+    : '_None detected_';
+
+  return `---
+title: "${escYaml(session.title)}"
+source: ${sourceTag}
+date: ${isoFull}
+turns: ${session.turnCount}
+signal: ${sessionSignal}
+concepts: ${topConceptNames.length}
+tags: [session, ${sourceTag}]${fmExtrasStr}
+---
+
+# ${session.title}
+
+> Source: **${sourceTag}** | ${date} | ${session.turnCount} turns
+
+${summarySection}
+## Key Decisions
+${decisionsSection}
+
+## Key Issues
+${issuesSection}
+
+## Action Items
+${actionsSection}
+
+## Change Signals
+${commitsSection}
+
+## Top Concepts
+${topConceptLinks}
+${sourceContextSection}
 ## Code Snippets
 ${snippetLinks}
 
@@ -369,6 +499,7 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   const sources = [...new Set(sessionEntries.map(({ session }) => session.source))];
 
   const displayName = titleCase(concept);
+  const conceptMeta = aggregateConceptRecord(concept, sessionEntries);
 
   // ── New signal enhancement fields ─────────────────────────────────────────
 
@@ -377,13 +508,14 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   const recentlyActive = recencyBoost > 0;
 
   // Decision pattern diversity
-  const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const re = conceptRegex(concept);
   const foundPatternTypes = new Set();
   for (const item of sessionEntries) {
     if (!item || !item.extracted) continue;
-    for (const decision of (item.extracted.decisions || [])) {
-      if (!re.test(decision)) continue;
-      const type = classifyDecisionPattern(decision);
+    for (const decision of getStructuredItems(item.extracted.decisionItems, item.extracted.decisions || [])) {
+      const text = decision.text || decision;
+      if (!re.test(text)) continue;
+      const type = classifyDecisionPattern(text);
       if (type) foundPatternTypes.add(type);
     }
   }
@@ -400,8 +532,10 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
     decisionsSection = conceptDecisions
       .slice(0, 10)
       .map((d) => {
-        const dateStr = d.sessionDate ? ` (${d.sessionDate},` : ' (';
-        return `- ${d.sentence}${dateStr} [[sessions/${d.sessionSlug}]])`;
+        const detail = d.sessionDate
+          ? `${d.sessionDate}, [[sessions/${d.sessionSlug}|${escYaml(d.sessionTitle)}]]`
+          : `[[sessions/${d.sessionSlug}|${escYaml(d.sessionTitle)}]]`;
+        return `- ${d.sentence} (${detail})`;
       })
       .join('\n');
   }
@@ -421,10 +555,10 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   const codeEntries = [];
   for (const { session, extracted } of allSessions) {
     if (!mentionedIn.includes(session.id)) continue;
-    const codeRe = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+    const codeRe = conceptRegex(concept);
     for (const snippet of (extracted.snippets || [])) {
       if (snippet && snippet.code && codeRe.test(snippet.code)) {
-        const paddedIdx = String(snippet.index + 1).padStart(3, '0');
+        const paddedIdx = String(snippet._globalIndex || (snippet.index + 1)).padStart(3, '0');
         const label     = deriveSnippetLabel(snippet.code);
         codeEntries.push(`- [[code/snippet-${paddedIdx}]] — ${snippet.lang || 'text'}${label ? ` — ${label}` : ''}`);
       }
@@ -436,7 +570,10 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   }
 
   // ── Related concepts ─────────────────────────────────────────────────────
-  const related = findRelatedConcepts(concept, mentionedIn, allSessions);
+  const related = [...new Set([
+    ...conceptMeta.related,
+    ...findRelatedConcepts(concept, mentionedIn, allSessions),
+  ])];
   const relatedLinks = related.slice(0, 8).map((c) =>
     `- [[concepts/${slugify(c)}|${c}]]`
   ).join('\n') || '_None_';
@@ -461,8 +598,9 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
   for (const item of sessionEntries) {
     if (!item || !item.extracted) continue;
     _sessionCount++;
-    for (const d of (item.extracted.decisions || [])) {
-      if (re.test(d)) _decisionCount++;
+    for (const d of getStructuredItems(item.extracted.decisionItems, item.extracted.decisions || [])) {
+      const text = d.text || d;
+      if (re.test(text)) _decisionCount++;
     }
     for (const snippet of (item.extracted.snippets || [])) {
       if (snippet && snippet.code && re.test(snippet.code)) _codeCount++;
@@ -520,6 +658,10 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
     `signal: ${score}`,
     `sessions: ${mentionedIn.length}`,
     `decisions: ${conceptDecisions.length}`,
+    `kind: ${conceptMeta.kind}`,
+    conceptMeta.aliases.length > 0
+      ? `aliases: [${conceptMeta.aliases.map((alias) => `"${escYaml(alias)}"`).join(', ')}]`
+      : '',
     firstDate ? `first-seen: ${firstDate}` : '',
     lastDate  ? `last-seen: ${lastDate}`   : '',
     `recently-active: ${recentlyActive}`,
@@ -546,6 +688,26 @@ function renderConceptNote(concept, mentionedIn, allSessions, signalScore, allSe
       skillParts.push(`Invoked in: ${uniqueSlugs.join(', ')}`);
     }
     parts.push(`## Skill Definition\n${skillParts.join('\n\n')}\n`);
+  }
+
+  if (conceptMeta.aliases.length > 0 || conceptMeta.files.length > 0 || conceptMeta.tools.length > 0 || conceptMeta.workspaces.length > 0) {
+    const hintParts = [];
+    if (conceptMeta.aliases.length > 0) {
+      hintParts.push(`- Aliases: ${conceptMeta.aliases.map((alias) => `\`${alias}\``).join(', ')}`);
+    }
+    if (conceptMeta.files.length > 0) {
+      hintParts.push(`- Files: ${conceptMeta.files.slice(0, 8).map((file) => `\`${file}\``).join(', ')}`);
+    }
+    if (conceptMeta.tools.length > 0) {
+      hintParts.push(`- Tools: ${conceptMeta.tools.slice(0, 8).map((tool) => `\`${tool}\``).join(', ')}`);
+    }
+    if (conceptMeta.workspaces.length > 0) {
+      hintParts.push(`- Workspaces: ${conceptMeta.workspaces.map((workspace) => `\`${workspace}\``).join(', ')}`);
+    }
+    if (conceptMeta.sourceTypes.length > 0) {
+      hintParts.push(`- Evidence: ${conceptMeta.sourceTypes.join(', ')}`);
+    }
+    parts.push(`## Link Hints\n${hintParts.join('\n')}\n`);
   }
 
   if (decisionsSection) {
@@ -808,7 +970,7 @@ function buildConceptMap(sessions) {
   const map = new Map();
 
   for (const { session, extracted } of sessions) {
-    for (const concept of extracted.concepts) {
+    for (const concept of getConceptNames(extracted)) {
       const key = concept.toLowerCase();
       if (!map.has(key)) map.set(key, []);
       if (!map.get(key).includes(session.id)) {
@@ -829,7 +991,7 @@ function findRelatedConcepts(concept, mentionedIn, allSessions) {
   for (const { session, extracted } of allSessions) {
     if (!mentionedIn.includes(session.id)) continue;
 
-    for (const c of extracted.concepts) {
+    for (const c of getConceptNames(extracted)) {
       if (c.toLowerCase() === concept.toLowerCase()) continue;
       cooccur.set(c, (cooccur.get(c) || 0) + 1);
     }

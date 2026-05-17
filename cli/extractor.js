@@ -96,8 +96,25 @@ const CONCEPT_STOPWORDS = new Set([
 const DECISION_PATTERNS = [
   /\b(decided|decision|we('re| are| will)?\s+(going|using|adopting|switching))\b/i,
   /\b(will use|we'll use|going with|chosen|we chose|opted for|settled on)\b/i,
-  /\b(action item|todo|follow.?up|next step|we need to|should|must|have to)\b/i,
   /\b(don('t| not) use|avoid|drop|remove|replace|migrate (from|away))\b/i,
+];
+
+const ISSUE_PATTERNS = [
+  /\b(issue|problem|bug|broken|failing|failure|regression|crash|blocked|stuck|missing)\b/i,
+  /\b(error|exception|stack trace|timeout|timed out|429|500|403|404|permission denied)\b/i,
+  /\b(can('?t|not)|won('?t)|doesn('?t)|didn('?t)|unable to|cannot)\b/i,
+  /\b(slow|latency|performance|hang|hung|degraded)\b/i,
+];
+
+const ACTION_ITEM_PATTERNS = [
+  /\b(action item|todo|follow.?up|next step|need to|needs to|should|must|have to|remember to)\b/i,
+  /^\s*[-*]\s+(todo|follow.?up|next step)\b/i,
+];
+
+const COMMIT_PATTERNS = [
+  /\b(git commit|commit message|committed|commit|pushed|push|merged|merge|pull request|opened pr|created pr)\b/i,
+  /\b(checkout|branch|rebase|cherry-pick|stash|squash)\b/i,
+  /\b[0-9a-f]{7,40}\b/i,
 ];
 
 // ── Sentences that signal a strong excerpt (decision or problem framing) ─────
@@ -120,6 +137,7 @@ const CONCLUSION_PATTERNS = [
 const URL_RE        = /https?:\/\/[^\s<>"')\]]+/g;
 const CODE_FENCE_RE = /```(\w*)\n([\s\S]*?)```/g;
 const BACKTICK_RE   = /`([^`\n]{2,60})`/g;
+const FILE_PATH_RE  = /(?:^|[\s("'`])((?:\.{1,2}\/)?(?:[A-Za-z0-9_.@~-]+\/)+[A-Za-z0-9_.@~-]+\.(?:c|cc|cpp|css|go|h|hpp|html|java|js|json|jsx|mjs|cjs|md|py|rb|rs|sh|sql|ts|tsx|txt|xml|ya?ml))(?=$|[\s)"'`,;:])/gm;
 
 // Capitalised multi-word phrases (Title Case), e.g. "Segment Store", "Oak Architecture"
 const TITLE_CASE_RE = /\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+){1,5})\b/g;
@@ -133,33 +151,87 @@ const PASCAL_RE = /\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b/g;
 // 500 KB of session text is more than enough for concept/decision extraction;
 // larger sessions are usually bloated by tool output or copied file contents.
 const MAX_EXTRACT_TEXT_LENGTH = 500_000;
+const MAX_CONCEPTS_PER_SESSION = 40;
 
 function extract(session) {
-  let fullText = session.messages.map((m) => m.content).join('\n\n');
+  const messages = Array.isArray(session?.messages)
+    ? session.messages.filter((m) => m && typeof m.content === 'string' && m.content.trim())
+    : [];
+
+  let fullText = messages.map((m) => m.content).join('\n\n');
+  const originalLength = fullText.length;
 
   // Truncate excessively long sessions to prevent regex stalls
   if (fullText.length > MAX_EXTRACT_TEXT_LENGTH) {
     fullText = fullText.slice(0, MAX_EXTRACT_TEXT_LENGTH);
   }
 
-  // Inject skill names as high-frequency terms so they surface as concepts.
-  // Each skill name gets a synthetic concept entry with count = sessions*2
-  // (effectively guaranteed to pass the signal threshold).
-  const extraConcepts = [];
-  if (session.skillsUsed && session.skillsUsed.length > 0) {
-    for (const skill of session.skillsUsed) {
-      extraConcepts.push(skill);
-    }
-  }
+  const snippets    = extractSnippets(fullText);
+  const urls        = extractUrls(fullText);
+  const entities    = extractEntities(fullText);
+  const files       = extractFileReferences(fullText, session);
+  const tools       = extractToolContext(session, fullText);
+  const workspaces  = extractWorkspaceContext(session);
+  const skills      = Array.isArray(session.skillsUsed) ? session.skillsUsed.filter(Boolean) : [];
 
-  const concepts = extractConcepts(fullText, extraConcepts);
+  const decisionItems = extractStructuredItems(messages, DECISION_PATTERNS, 'decision');
+  const issueItems    = extractStructuredItems(messages, ISSUE_PATTERNS, 'issue');
+  const actionItems   = extractStructuredItems(messages, ACTION_ITEM_PATTERNS, 'action');
+  const commitItems   = extractStructuredItems(messages, COMMIT_PATTERNS, 'commit');
+
+  const conceptObjects = buildConceptObjects({
+    session,
+    fullText,
+    messages,
+    snippets,
+    urls,
+    entities,
+    files,
+    tools,
+    workspaces,
+    skills,
+    decisionItems,
+    issueItems,
+    actionItems,
+    commitItems,
+  });
 
   return {
-    concepts,
-    decisions: extractDecisions(session.messages),
-    snippets:  extractSnippets(fullText),
-    urls:      extractUrls(fullText),
-    entities:  extractEntities(fullText),
+    concepts: conceptObjects.map((concept) => concept.name),
+    conceptObjects,
+    decisions: decisionItems.map((item) => item.text),
+    decisionItems,
+    issues: issueItems,
+    actionItems,
+    commits: commitItems,
+    snippets,
+    urls,
+    entities,
+    files,
+    tools,
+    technicalContext: {
+      files,
+      tools,
+      workspaces,
+      skills,
+      entities,
+    },
+    observability: buildExtractionObservability({
+      source: session?.source || 'unknown',
+      originalLength,
+      extractedLength: fullText.length,
+      truncated: originalLength > fullText.length,
+      conceptObjects,
+      decisionItems,
+      issueItems,
+      actionItems,
+      commitItems,
+      snippets,
+      urls,
+      files,
+      tools,
+      metaOnly: Boolean(session?.cursorMetaOnly),
+    }),
   };
 }
 
@@ -171,57 +243,347 @@ function extract(session) {
  *                                   always pass the frequency filter.
  */
 function extractConcepts(text, seedTerms = []) {
-  const freq  = new Map(); // normalised term → { display, count }
+  const conceptObjects = buildConceptObjects({
+    session: {},
+    fullText: text || '',
+    messages: [],
+    snippets: [],
+    urls: [],
+    entities: [],
+    files: [],
+    tools: [],
+    workspaces: [],
+    skills: seedTerms,
+    decisionItems: [],
+    issueItems: [],
+    actionItems: [],
+    commitItems: [],
+  });
+  return conceptObjects.map((concept) => concept.name);
+}
 
-  // 0. Seed terms (e.g. Codex skills) — injected with count 5 so they
-  //    always pass the ≥2 filter and score well in signal computation.
-  for (const term of seedTerms) {
-    if (!term || term.length < 2) continue;
-    const key = term.toLowerCase().trim();
-    if (CONCEPT_STOPWORDS.has(key)) continue;
-    // Use a high baseline count to ensure they surface as concepts
-    if (!freq.has(key)) {
-      freq.set(key, { display: term, count: 5 });
-    } else {
-      freq.get(key).count += 5;
+function buildConceptObjects({
+  session,
+  fullText,
+  messages,
+  snippets,
+  urls,
+  entities,
+  files,
+  tools,
+  workspaces,
+  skills,
+  decisionItems,
+  issueItems,
+  actionItems,
+  commitItems,
+}) {
+  const conceptMap = new Map();
+
+  const register = (rawValue, opts = {}) => registerConceptEvidence(conceptMap, rawValue, opts);
+
+  for (const skill of skills || []) {
+    register(skill, { sourceType: 'skill', kind: 'skill', weight: 6, evidenceText: skill });
+  }
+
+  for (const tool of tools || []) {
+    register(tool, { sourceType: 'tool', kind: 'tool', weight: 4, tool, evidenceText: tool });
+  }
+
+  for (const workspace of workspaces || []) {
+    register(workspace, { sourceType: 'workspace', kind: 'workspace', weight: 4, workspace, evidenceText: workspace });
+  }
+
+  if (session && session.title) {
+    addTextConceptEvidence(conceptMap, session.title, {
+      sourceType: 'title',
+      weight: 3,
+      allowSingle: true,
+      evidenceText: session.title,
+    });
+  }
+
+  addTextConceptEvidence(conceptMap, fullText, { sourceType: 'message', weight: 1, allowSingle: false });
+
+  for (const snippet of snippets || []) {
+    if (snippet && snippet.lang) {
+      register(snippet.lang, {
+        sourceType: 'snippet-language',
+        kind: 'technology',
+        weight: 2,
+        evidenceText: snippet.lang,
+      });
     }
   }
 
-  // 1. Backtick-wrapped identifiers
+  for (const fileRef of files || []) {
+    const fileName = pathTail(fileRef);
+    register(fileName, {
+      sourceType: 'file',
+      kind: 'artifact',
+      weight: 3,
+      allowSingle: true,
+      file: fileRef,
+      evidenceText: fileRef,
+    });
+  }
+
+  addStructuredConceptEvidence(conceptMap, decisionItems, { sourceType: 'decision', weight: 4, counter: 'decisionCount' });
+  addStructuredConceptEvidence(conceptMap, issueItems, { sourceType: 'issue', weight: 4, counter: 'issueCount' });
+  addStructuredConceptEvidence(conceptMap, actionItems, { sourceType: 'action', weight: 3, counter: 'actionItemCount' });
+  addStructuredConceptEvidence(conceptMap, commitItems, { sourceType: 'commit', weight: 3, counter: 'commitCount' });
+
+  for (const entity of entities || []) {
+    register(KEYWORD_DISPLAY[entity] || entity, {
+      sourceType: 'entity',
+      kind: 'technology',
+      weight: 2,
+      evidenceText: entity,
+    });
+  }
+
+  const results = [...conceptMap.values()]
+    .map(finalizeConceptObject)
+    .filter(shouldKeepConcept)
+    .sort((a, b) =>
+      b.score - a.score ||
+      b.mentionCount - a.mentionCount ||
+      a.name.localeCompare(b.name)
+    )
+    .slice(0, MAX_CONCEPTS_PER_SESSION);
+
+  return results;
+}
+
+function addStructuredConceptEvidence(conceptMap, items, { sourceType, weight, counter }) {
+  for (const item of items || []) {
+    const candidateKeys = [];
+
+    for (const candidate of collectTextConceptCandidates(item.text, { allowSingle: true, includeFiles: true })) {
+      const key = registerConceptEvidence(conceptMap, candidate.display, {
+        sourceType,
+        kind: candidate.kind,
+        weight,
+        evidenceText: item.text,
+        role: item.role,
+        timestamp: item.timestamp,
+        counter,
+        file: candidate.file || null,
+      });
+      if (key) candidateKeys.push(key);
+    }
+
+    item.concepts = uniqueDisplayNames(
+      candidateKeys.map((key) => conceptMap.get(key)?.name).filter(Boolean)
+    );
+
+    connectRelatedConcepts(conceptMap, candidateKeys);
+  }
+}
+
+function addTextConceptEvidence(conceptMap, text, { sourceType, weight, allowSingle, evidenceText }) {
+  for (const candidate of collectTextConceptCandidates(text, { allowSingle, includeFiles: true })) {
+    registerConceptEvidence(conceptMap, candidate.display, {
+      sourceType,
+      kind: candidate.kind,
+      weight,
+      evidenceText: evidenceText || text,
+      file: candidate.file || null,
+    });
+  }
+}
+
+function registerConceptEvidence(conceptMap, rawValue, {
+  sourceType = 'message',
+  kind = 'topic',
+  weight = 1,
+  evidenceText = '',
+  role = null,
+  timestamp = null,
+  counter = null,
+  file = null,
+  tool = null,
+  workspace = null,
+} = {}) {
+  const concept = normaliseConceptValue(rawValue);
+  if (!concept) return null;
+
+  const key = normaliseConceptKey(concept);
+  let draft = conceptMap.get(key);
+  if (!draft) {
+    draft = {
+      key,
+      name: concept,
+      kind,
+      aliases: new Set(),
+      sourceTypes: new Set(),
+      mentionCount: 0,
+      score: 0,
+      decisionCount: 0,
+      issueCount: 0,
+      actionItemCount: 0,
+      commitCount: 0,
+      codeCount: 0,
+      evidence: [],
+      files: new Set(),
+      tools: new Set(),
+      workspaces: new Set(),
+      related: new Map(),
+    };
+    conceptMap.set(key, draft);
+  } else if (shouldReplaceDisplayName(draft.name, concept)) {
+    draft.aliases.add(draft.name);
+    draft.name = concept;
+  } else if (concept !== draft.name) {
+    draft.aliases.add(concept);
+  }
+
+  draft.kind = pickConceptKind(draft.kind, kind);
+  draft.sourceTypes.add(sourceType);
+  draft.mentionCount++;
+  draft.score += weight;
+
+  if (counter && typeof draft[counter] === 'number') {
+    draft[counter]++;
+  }
+  if (file) draft.files.add(file);
+  if (tool) draft.tools.add(tool);
+  if (workspace) draft.workspaces.add(workspace);
+
+  if (evidenceText) {
+    const excerpt = normaliseInline(evidenceText).slice(0, 220);
+    if (excerpt && !draft.evidence.some((entry) => entry.text === excerpt && entry.type === sourceType)) {
+      draft.evidence.push({
+        type: sourceType,
+        text: excerpt,
+        role,
+        timestamp,
+      });
+    }
+  }
+
+  return key;
+}
+
+function collectTextConceptCandidates(text, { allowSingle = false, includeFiles = false } = {}) {
+  const candidates = [];
+  if (!text) return candidates;
+
   for (const [, term] of text.matchAll(BACKTICK_RE)) {
-    const t = term.trim();
-    if (t.length < 2 || t.includes('\n')) continue;
-    if (CONCEPT_STOPWORDS.has(t.toLowerCase())) continue;
-    bump(freq, t.toLowerCase(), t);
+    const value = normaliseConceptValue(term, { allowSingle });
+    if (!value) continue;
+    candidates.push({ display: value, kind: looksLikeFileRef(value) ? 'artifact' : 'topic' });
   }
 
-  // 2. Known tech keywords (case-insensitive) — preserve canonical display form
-  const words = text.toLowerCase().split(/\W+/);
-  for (const w of words) {
-    if (TECH_KEYWORDS.has(w)) {
-      bump(freq, w, KEYWORD_DISPLAY[w] || w);
+  if (includeFiles) {
+    for (const fileRef of extractFileReferences(text)) {
+      const fileName = pathTail(fileRef);
+      const display = normaliseConceptValue(fileName, { allowSingle: true });
+      if (!display) continue;
+      candidates.push({ display, kind: 'artifact', file: fileRef });
     }
   }
 
-  // 3. Title-cased multi-word phrases
+  const lower = text.toLowerCase();
+  for (const keyword of TECH_KEYWORDS) {
+    const re = keywordNeedsLooseBoundary(keyword)
+      ? new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(keyword)}(?=$|[^A-Za-z0-9])`, 'i')
+      : new RegExp(`\\b${escapeRegex(keyword)}\\b`, 'i');
+    if (!re.test(lower)) continue;
+    candidates.push({ display: KEYWORD_DISPLAY[keyword] || keyword, kind: 'technology' });
+  }
+
   for (const [, phrase] of text.matchAll(TITLE_CASE_RE)) {
-    const key = phrase.toLowerCase();
-    if (key.split(' ').length < 2) continue;      // must be ≥2 words
     if (isStopPhrase(phrase)) continue;
-    bump(freq, key, phrase);
+    const value = normaliseConceptValue(phrase, { allowSingle: true });
+    if (!value) continue;
+    candidates.push({ display: value, kind: 'topic' });
   }
 
-  // 4. PascalCase compound words
   for (const [, token] of text.matchAll(PASCAL_RE)) {
-    if (token.length < 5) continue;
-    bump(freq, token.toLowerCase(), token);
+    const value = normaliseConceptValue(token, { allowSingle: true });
+    if (!value) continue;
+    candidates.push({ display: value, kind: 'topic' });
   }
 
-  // Return concepts that appeared at least twice (or were seeded), sorted by frequency desc
-  return [...freq.entries()]
-    .filter(([, v]) => v.count >= 2)
-    .sort((a, b) => b[1].count - a[1].count)
-    .map(([, v]) => v.display);
+  return dedupConceptCandidates(candidates);
+}
+
+function dedupConceptCandidates(candidates) {
+  const seen = new Set();
+  const results = [];
+
+  for (const candidate of candidates) {
+    const key = `${normaliseConceptKey(candidate.display)}::${candidate.kind}::${candidate.file || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    results.push(candidate);
+  }
+
+  return results;
+}
+
+function finalizeConceptObject(draft) {
+  const relatedConcepts = [...draft.related.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([key, count]) => ({ key, count }));
+
+  return {
+    key: draft.key,
+    name: draft.name,
+    kind: draft.kind,
+    aliases: [...draft.aliases].sort(),
+    sourceTypes: [...draft.sourceTypes].sort(),
+    mentionCount: draft.mentionCount,
+    score: draft.score
+      + draft.decisionCount * 3
+      + draft.issueCount * 3
+      + draft.actionItemCount * 2
+      + draft.commitCount * 2
+      + draft.codeCount * 2
+      + draft.files.size
+      + draft.tools.size
+      + draft.workspaces.size,
+    decisionCount: draft.decisionCount,
+    issueCount: draft.issueCount,
+    actionItemCount: draft.actionItemCount,
+    commitCount: draft.commitCount,
+    codeCount: draft.codeCount,
+    files: [...draft.files].slice(0, 12),
+    tools: [...draft.tools].slice(0, 12),
+    workspaces: [...draft.workspaces].slice(0, 8),
+    evidence: draft.evidence.slice(0, 6),
+    relatedConcepts,
+  };
+}
+
+function shouldKeepConcept(concept) {
+  if (!concept) return false;
+  if (concept.mentionCount >= 2) return true;
+  if (concept.decisionCount > 0 || concept.issueCount > 0 || concept.actionItemCount > 0 || concept.commitCount > 0) {
+    return true;
+  }
+  if (concept.files.length > 0 || concept.tools.length > 0 || concept.workspaces.length > 0) {
+    return true;
+  }
+  if (concept.kind === 'skill' || concept.kind === 'tool' || concept.kind === 'workspace') {
+    return true;
+  }
+  return concept.score >= 4;
+}
+
+function connectRelatedConcepts(conceptMap, keys) {
+  const uniqueKeys = [...new Set(keys)].filter(Boolean);
+  for (let i = 0; i < uniqueKeys.length; i++) {
+    for (let j = i + 1; j < uniqueKeys.length; j++) {
+      const left = conceptMap.get(uniqueKeys[i]);
+      const right = conceptMap.get(uniqueKeys[j]);
+      if (!left || !right) continue;
+      left.related.set(right.key, (left.related.get(right.key) || 0) + 1);
+      right.related.set(left.key, (right.related.get(left.key) || 0) + 1);
+    }
+  }
 }
 
 function bump(map, key, display) {
@@ -250,22 +612,7 @@ function isStopPhrase(phrase) {
 
 // ── Decisions ─────────────────────────────────────────────────────────────────
 function extractDecisions(messages) {
-  const decisions = [];
-
-  for (const msg of messages) {
-    const lines = msg.content.split(/[.!?]\s+|\n/);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.length < 10 || trimmed.length > 500) continue;
-
-      if (DECISION_PATTERNS.some((re) => re.test(trimmed))) {
-        decisions.push(trimmed);
-      }
-    }
-  }
-
-  // Deduplicate near-identical decisions
-  return dedupStrings(decisions);
+  return extractStructuredItems(messages, DECISION_PATTERNS, 'decision').map((item) => item.text);
 }
 
 // ── Code snippets ─────────────────────────────────────────────────────────────
@@ -303,8 +650,7 @@ function extractEntities(text) {
   const lower = text.toLowerCase();
 
   for (const kw of TECH_KEYWORDS) {
-    // Use word-boundary matching on the lowercase text
-    const re = new RegExp(`\\b${escapeRegex(kw)}\\b`, 'i');
+    const re = buildConceptRegex(kw);
     if (re.test(lower)) {
       found.add(kw);
     }
@@ -313,12 +659,148 @@ function extractEntities(text) {
   return [...found].sort();
 }
 
+function extractStructuredItems(messages, patterns, kind) {
+  const items = [];
+  const seen = new Set();
+
+  for (const msg of messages || []) {
+    const units = splitMessageIntoUnits(msg.content || '');
+    for (const unit of units) {
+      if (unit.length < 12 || unit.length > 420) continue;
+      if (!patterns.some((re) => re.test(unit))) continue;
+
+      const key = unit.toLowerCase().replace(/\s+/g, ' ');
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      items.push({
+        type: kind,
+        text: unit,
+        role: msg.role || null,
+        timestamp: msg.timestamp || null,
+        concepts: [],
+      });
+    }
+  }
+
+  return items;
+}
+
+function splitMessageIntoUnits(text) {
+  if (!text) return [];
+  const stripped = stripCodeFences(text);
+  return stripped
+    .split(/\n{2,}|(?<=[.!?])\s+/)
+    .flatMap((part) => part.split('\n'))
+    .map((part) => normaliseInline(part))
+    .filter(Boolean);
+}
+
+function stripCodeFences(text) {
+  return String(text || '').replace(/```[\s\S]*?```/g, ' ');
+}
+
+function extractFileReferences(text, session) {
+  const found = new Set(Array.isArray(session?.filesTouched) ? session.filesTouched : []);
+  if (text) {
+    for (const match of text.matchAll(FILE_PATH_RE)) {
+      const fileRef = normaliseInline(match[1]).replace(/[,;.]+$/, '');
+      if (fileRef) found.add(fileRef);
+    }
+  }
+  return [...found].slice(0, 20);
+}
+
+function extractToolContext(session, text) {
+  const tools = new Set();
+  if (Array.isArray(session?.toolCalls)) {
+    for (const toolCall of session.toolCalls) {
+      if (toolCall && toolCall.tool) tools.add(toolCall.tool);
+    }
+  }
+  const toolListMatch = String(text || '').match(/\[Tools called:\s*([^\]]+)\]/i);
+  if (toolListMatch) {
+    toolListMatch[1]
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .forEach((tool) => tools.add(tool));
+  }
+  return [...tools].slice(0, 20);
+}
+
+function extractWorkspaceContext(session) {
+  const workspaces = [];
+  const candidates = [
+    session?.workspacePath,
+    session?.workspaceName,
+    session?.cwd,
+    session?.workspace,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const name = typeof candidate === 'string' && candidate.includes('/')
+      ? pathTail(candidate)
+      : String(candidate);
+    if (!name) continue;
+    if (/^[0-9a-f]{8,}$/i.test(name)) continue;
+    if (!workspaces.includes(name)) workspaces.push(name);
+  }
+
+  return workspaces.slice(0, 6);
+}
+
+function buildExtractionObservability({
+  source,
+  originalLength,
+  extractedLength,
+  truncated,
+  conceptObjects,
+  decisionItems,
+  issueItems,
+  actionItems,
+  commitItems,
+  snippets,
+  urls,
+  files,
+  tools,
+  metaOnly,
+}) {
+  const weakSignals = [];
+  if (metaOnly) weakSignals.push('metadata-only cursor session');
+  if (conceptObjects.length === 0) weakSignals.push('no concepts');
+  if (decisionItems.length === 0 && issueItems.length === 0 && actionItems.length === 0 && commitItems.length === 0) {
+    weakSignals.push('no structured signals');
+  }
+  if (snippets.length === 0 && files.length === 0 && tools.length === 0) {
+    weakSignals.push('thin technical context');
+  }
+  if (truncated) weakSignals.push('truncated input');
+
+  return {
+    source,
+    textLength: originalLength,
+    extractedLength,
+    truncated,
+    conceptCount: conceptObjects.length,
+    decisionCount: decisionItems.length,
+    issueCount: issueItems.length,
+    actionItemCount: actionItems.length,
+    commitCount: commitItems.length,
+    snippetCount: snippets.length,
+    urlCount: urls.length,
+    fileCount: files.length,
+    toolCount: tools.length,
+    weakSignals,
+  };
+}
+
 // ── Signal scoring ────────────────────────────────────────────────────────────
 
 // ── Decision pattern classification keywords ──────────────────────────────────
 const DECISION_PATTERN_KEYWORDS = {
   CHOICE:       /\b(decided|going with|chosen|opted for|will use|we'?ll use|going to use)\b/i,
-  AVOIDANCE:    /\b(avoid|don'?t use|not using|rejected|against|won'?t use|shouldn'?t use)\b/i,
+  AVOIDANCE:    /\b(avoid(?:\s+using)?|do not use|don'?t use|not using|rejected|against|won'?t use|shouldn'?t use)\b/i,
   EVOLUTION:    /\b(switched|migrated|replaced|moved away from|deprecated|refactored away)\b/i,
   CONFIRMATION: /\b(confirmed|still using|keeping|sticking with|continuing with|works well)\b/i,
 };
@@ -348,7 +830,7 @@ function classifyDecisionPattern(sentence) {
 function computeDecisionPatternDiversity(concept, sessionItems) {
   if (!concept || !Array.isArray(sessionItems)) return 0;
 
-  const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const re = buildConceptRegex(concept);
   const foundTypes = new Set();
 
   for (const item of sessionItems) {
@@ -413,11 +895,14 @@ function computeRecencyBonus(conceptKey, sessionItems, allSessions) {
 function computeSignalScore(concept, sessionItems, allSessions) {
   if (!concept || !Array.isArray(sessionItems)) return 0;
 
-  const conceptLower = concept.toLowerCase();
-  const re = new RegExp(`\\b${escapeRegex(conceptLower)}\\b`, 'i');
+  const conceptLower = normaliseConceptKey(concept);
+  const re = buildConceptRegex(conceptLower);
 
   let sessionCount     = 0;
   let decisionCount    = 0;
+  let issueCount       = 0;
+  let actionItemCount  = 0;
+  let commitCount      = 0;
   let codeCount        = 0;
   const projectSources = new Set();
 
@@ -428,29 +913,26 @@ function computeSignalScore(concept, sessionItems, allSessions) {
     if (!item || !item.session || !item.extracted) continue;
 
     const { session, extracted } = item;
+    const conceptRecord = findConceptRecord(extracted, conceptLower);
 
     // Check whether this concept appears in this session's concept list
-    const appearsInSession = (extracted.concepts || []).some(
-      (c) => c.toLowerCase() === conceptLower
+    const appearsInSession = Boolean(conceptRecord) || (extracted.concepts || []).some(
+      (c) => normaliseConceptKey(c) === conceptLower
     );
     if (!appearsInSession) continue;
 
     sessionCount++;
     conceptSessionItems.push(item);
 
-    // Count decision sentences mentioning this concept
-    for (const d of (extracted.decisions || [])) {
-      if (re.test(d)) decisionCount++;
-    }
-
-    // Count code snippets whose code body mentions this concept
-    for (const snippet of (extracted.snippets || [])) {
-      if (snippet && snippet.code && re.test(snippet.code)) codeCount++;
-    }
+    decisionCount   += conceptRecord?.decisionCount   || countMatchingStrings(extracted.decisionItems || extracted.decisions || [], re);
+    issueCount      += conceptRecord?.issueCount      || countMatchingStrings(extracted.issues || [], re);
+    actionItemCount += conceptRecord?.actionItemCount || countMatchingStrings(extracted.actionItems || [], re);
+    commitCount     += conceptRecord?.commitCount     || countMatchingStrings(extracted.commits || [], re);
+    codeCount       += conceptRecord?.codeCount       || countMatchingCode(extracted.snippets || [], re);
 
     // Track distinct project/workspace sources
     if (session.source) projectSources.add(session.source);
-    // Also track by workspace path if available (miners may set session.workspacePath)
+    if (session.workspace) projectSources.add(session.workspace);
     if (session.workspacePath) projectSources.add(session.workspacePath);
   }
 
@@ -472,6 +954,9 @@ function computeSignalScore(concept, sessionItems, allSessions) {
 
   return (sessionCount * 2)
        + (decisionCount * 5)
+       + (issueCount * 4)
+       + (actionItemCount * 4)
+       + (commitCount * 3)
        + (codeCount * 3)
        + (crossProjectCount * 4)
        + (decisionPatternDiversity * 2)
@@ -491,7 +976,8 @@ function computeSignalScore(concept, sessionItems, allSessions) {
 function extractConceptDecisions(concept, sessionItems) {
   if (!concept || !Array.isArray(sessionItems)) return [];
 
-  const re = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const key = normaliseConceptKey(concept);
+  const re = buildConceptRegex(key);
   const results = [];
   const seen    = new Set();
 
@@ -502,15 +988,19 @@ function extractConceptDecisions(concept, sessionItems) {
     const sessionDate = _isoDate(session.timestamp);
     const sessionSlug = _sessionFileName(session).replace('.md', '');
 
-    for (const decision of (extracted.decisions || [])) {
-      if (!re.test(decision)) continue;
+    const sourceItems = extracted.decisionItems || (extracted.decisions || []).map((text) => ({ text, concepts: [] }));
+    for (const decision of sourceItems) {
+      const text = typeof decision === 'string' ? decision : decision.text;
+      const concepts = decision && Array.isArray(decision.concepts) ? decision.concepts : [];
+      const matchesConcept = concepts.some((name) => normaliseConceptKey(name) === key) || re.test(text);
+      if (!matchesConcept) continue;
 
-      const key = decision.toLowerCase().replace(/\s+/g, ' ');
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const seenKey = text.toLowerCase().replace(/\s+/g, ' ');
+      if (seen.has(seenKey)) continue;
+      seen.add(seenKey);
 
       results.push({
-        sentence:     decision,
+        sentence:     text,
         sessionTitle: session.title || sessionSlug,
         sessionDate,
         sessionSlug,
@@ -536,7 +1026,8 @@ function extractConceptDecisions(concept, sessionItems) {
 function extractConceptExcerpts(concept, sessionItems, maxExcerpts = 5) {
   if (!concept || !Array.isArray(sessionItems)) return [];
 
-  const re       = new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+  const key      = normaliseConceptKey(concept);
+  const re       = buildConceptRegex(key);
   const excerpts = [];
   const seenKeys = new Set();
 
@@ -546,8 +1037,8 @@ function extractConceptExcerpts(concept, sessionItems, maxExcerpts = 5) {
     const { session, extracted } = item;
 
     // Only look in sessions where this concept appears
-    const appearsInSession = (extracted.concepts || []).some(
-      (c) => c.toLowerCase() === concept.toLowerCase()
+    const appearsInSession = Boolean(findConceptRecord(extracted, key)) || (extracted.concepts || []).some(
+      (c) => normaliseConceptKey(c) === key
     );
     if (!appearsInSession) continue;
 
@@ -664,6 +1155,8 @@ function extractSessionNarrative(session, extracted) {
   // ── Approach: decision sentences, or top concept names ────────────────────
   let approach = '';
   const decisions = extracted && extracted.decisions ? extracted.decisions : [];
+  const issues    = extracted && extracted.issues ? extracted.issues.map((item) => item.text || item) : [];
+  const actions   = extracted && extracted.actionItems ? extracted.actionItems.map((item) => item.text || item) : [];
 
   if (decisions.length > 0) {
     // Take the most informative decision (longest one up to 200 chars)
@@ -674,6 +1167,20 @@ function extractSessionNarrative(session, extracted) {
 
     if (best) {
       approach = best.endsWith('.') ? best : best + '.';
+    }
+  }
+
+  if (!approach) {
+    const strongProblem = issues.find((item) => item.length <= 180);
+    if (strongProblem) {
+      approach = strongProblem.endsWith('.') ? strongProblem : strongProblem + '.';
+    }
+  }
+
+  if (!approach) {
+    const nextStep = actions.find((item) => item.length <= 180);
+    if (nextStep) {
+      approach = nextStep.endsWith('.') ? nextStep : nextStep + '.';
     }
   }
 
@@ -756,6 +1263,97 @@ function dedupStrings(arr) {
   });
 }
 
+function uniqueDisplayNames(arr) {
+  return [...new Set(arr.filter(Boolean))];
+}
+
+function findConceptRecord(extracted, conceptKey) {
+  const key = normaliseConceptKey(conceptKey);
+  const concepts = Array.isArray(extracted?.conceptObjects) ? extracted.conceptObjects : [];
+  return concepts.find((concept) =>
+    concept.key === key ||
+    normaliseConceptKey(concept.name) === key ||
+    (concept.aliases || []).some((alias) => normaliseConceptKey(alias) === key)
+  ) || null;
+}
+
+function countMatchingStrings(items, re) {
+  let count = 0;
+  for (const item of items || []) {
+    const text = typeof item === 'string' ? item : item?.text;
+    if (text && re.test(text)) count++;
+  }
+  return count;
+}
+
+function countMatchingCode(snippets, re) {
+  let count = 0;
+  for (const snippet of snippets || []) {
+    if (snippet && snippet.code && re.test(snippet.code)) count++;
+  }
+  return count;
+}
+
+function normaliseConceptValue(value, { allowSingle = false } = {}) {
+  if (!value) return null;
+  const text = normaliseInline(value)
+    .replace(/^['"`]+|['"`]+$/g, '')
+    .replace(/\s+/g, ' ');
+
+  if (!text || text.length < 2 || text.length > 80) return null;
+  if (!allowSingle && text.split(/\s+/).length > 6) return null;
+  if (CONCEPT_STOPWORDS.has(text.toLowerCase())) return null;
+  if (/^[^A-Za-z0-9]+$/.test(text)) return null;
+  if (/^(todo|fix|issue|problem|next step)$/i.test(text)) return null;
+  return text;
+}
+
+function normaliseConceptKey(value) {
+  return normaliseInline(value)
+    .toLowerCase()
+    .replace(/^['"`]+|['"`]+$/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+function normaliseInline(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function keywordNeedsLooseBoundary(keyword) {
+  return /[.+#/\- ]/.test(keyword);
+}
+
+function looksLikeFileRef(value) {
+  return /[\\/]/.test(value) || /\.[A-Za-z0-9]{1,8}$/.test(value);
+}
+
+function pathTail(value) {
+  const cleaned = String(value || '').replace(/[\\/]+$/, '');
+  const parts = cleaned.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || cleaned;
+}
+
+function shouldReplaceDisplayName(current, incoming) {
+  if (!current) return true;
+  if (KEYWORD_DISPLAY[normaliseConceptKey(incoming)] === incoming) return true;
+  if (/[A-Z]/.test(incoming) && !/[A-Z]/.test(current)) return true;
+  return incoming.length < current.length && incoming.includes('-');
+}
+
+function pickConceptKind(current, next) {
+  const priority = { skill: 5, tool: 4, workspace: 4, artifact: 3, technology: 2, topic: 1 };
+  const currentPriority = priority[current] || 0;
+  const nextPriority = priority[next] || 0;
+  return nextPriority > currentPriority ? next : current;
+}
+
+function buildConceptRegex(value) {
+  const concept = normaliseConceptKey(value);
+  return keywordNeedsLooseBoundary(concept)
+    ? new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(concept)}(?=$|[^A-Za-z0-9])`, 'i')
+    : new RegExp(`\\b${escapeRegex(concept)}\\b`, 'i');
+}
+
 
 function escapeRegex(s) {
   return s.replace(/[-.*+?^${}()|[\]\\]/g, '\\$' + '&');
@@ -773,13 +1371,23 @@ const SESSION_TIER_MEDIUM = 5;
 function computeSessionScore(session, extracted) {
   const turnCount       = session.turnCount    || session.messages?.length || 0;
   const decisionCount   = extracted.decisions   ? extracted.decisions.length  : 0;
+  const issueCount      = extracted.issues      ? extracted.issues.length     : 0;
+  const actionCount     = extracted.actionItems ? extracted.actionItems.length : 0;
+  const commitCount     = extracted.commits     ? extracted.commits.length    : 0;
   const snippetCount    = extracted.snippets    ? extracted.snippets.length   : 0;
   const conceptCount    = extracted.concepts    ? extracted.concepts.length   : 0;
+  const fileCount       = extracted.files       ? extracted.files.length       : 0;
+  const toolCount       = extracted.tools       ? extracted.tools.length       : 0;
 
   return (turnCount * 0.5)
        + (decisionCount * 3)
+       + (issueCount * 2.5)
+       + (actionCount * 2.5)
+       + (commitCount * 2)
        + (snippetCount * 2)
-       + (conceptCount * 0.3);
+       + (conceptCount * 0.3)
+       + (fileCount * 0.2)
+       + (toolCount * 0.3);
 }
 
 function sessionTier(score) {

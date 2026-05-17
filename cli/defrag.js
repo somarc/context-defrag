@@ -31,7 +31,7 @@ const { execFile }  = require('child_process');
 const claudeMiner  = require('./miners/claude');
 const codexMiner   = require('./miners/codex');
 const cursorMiner  = require('./miners/cursor');
-const { extract, computeSessionScore, sessionTier }  = require('./extractor');
+const { extract, computeSignalScore, computeSessionScore, sessionTier }  = require('./extractor');
 const { write }    = require('./writers/obsidian');
 const { link }     = require('./writers/linker');
 const tui          = require('./tui');
@@ -220,6 +220,13 @@ async function runPipeline(opts) {
   const total = dedupedSessions.length;
 
   let tierCounts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
+  const extractionHealth = {
+    weakSessionCount: 0,
+    metadataOnlyCursorSessions: 0,
+    truncatedSessions: 0,
+    weakSessions: [],
+    sourceStats: {},
+  };
 
   for (let si = 0; si < total; si++) {
     const session = dedupedSessions[si];
@@ -233,6 +240,7 @@ async function runPipeline(opts) {
     await new Promise(resolve => setImmediate(resolve));
 
     const extracted = extract(session);
+    const obs = extracted.observability || null;
 
     // ── Compute session signal score and tier ───────────────────────────
     const sessScore = computeSessionScore(session, extracted);
@@ -248,10 +256,43 @@ async function runPipeline(opts) {
 
     // ── Always log a compact per-session line ───────────────────────────
     const decisionCount = extracted.decisions ? extracted.decisions.length : 0;
+    const issueCount    = extracted.issues ? extracted.issues.length : 0;
+    const actionCount   = extracted.actionItems ? extracted.actionItems.length : 0;
+    const commitCount   = extracted.commits ? extracted.commits.length : 0;
     const tierTag       = tier === 'HIGH' ? '▲' : tier === 'MEDIUM' ? '●' : '·';
     tui.log(
-      `[EXTRACT] ${tierTag} ${session.source} ${isoDate(session.timestamp)} "${truncate(session.title, 36)}" — ${extracted.concepts.length}c ${decisionCount}d`
+      `[EXTRACT] ${tierTag} ${session.source} ${isoDate(session.timestamp)} "${truncate(session.title, 36)}" — ${extracted.concepts.length}c ${decisionCount}d ${issueCount}i ${actionCount}a ${commitCount}g`
     );
+
+    if (obs) {
+      const sourceBucket = extractionHealth.sourceStats[session.source] || {
+        sessions: 0,
+        weak: 0,
+        concepts: 0,
+        structured: 0,
+      };
+      sourceBucket.sessions++;
+      sourceBucket.concepts += obs.conceptCount || 0;
+      sourceBucket.structured += (obs.decisionCount || 0) + (obs.issueCount || 0) + (obs.actionItemCount || 0) + (obs.commitCount || 0);
+
+      if (obs.truncated) extractionHealth.truncatedSessions++;
+      if (session.cursorMetaOnly) extractionHealth.metadataOnlyCursorSessions++;
+      if (Array.isArray(obs.weakSignals) && obs.weakSignals.length > 0) {
+        extractionHealth.weakSessionCount++;
+        sourceBucket.weak++;
+        if (extractionHealth.weakSessions.length < 20) {
+          extractionHealth.weakSessions.push({
+            id: session.id,
+            title: session.title,
+            source: session.source,
+            date: isoDate(session.timestamp),
+            weakSignals: obs.weakSignals,
+          });
+        }
+        tui.log(`[WARN] Weak extraction ${session.source} "${truncate(session.title, 30)}" — ${obs.weakSignals.join(', ')}`);
+      }
+      extractionHealth.sourceStats[session.source] = sourceBucket;
+    }
 
     // ── Verbose: extra concept detail ───────────────────────────────────
     if (opts.verbose) {
@@ -287,13 +328,21 @@ async function runPipeline(opts) {
   }
 
   tui.log(`[SCAN] Session tiers: ${tierCounts.HIGH} high, ${tierCounts.MEDIUM} medium, ${tierCounts.LOW} low`);
+  tui.log(`[SCAN] Extraction health: ${extractionHealth.weakSessionCount} weak, ${extractionHealth.metadataOnlyCursorSessions} cursor-metadata-only, ${extractionHealth.truncatedSessions} truncated`);
 
   const totalConcepts = conceptFreq.size;
   const totalSnippets = enriched.reduce((n, { extracted }) => n + extracted.snippets.length, 0);
   const totalUrls     = enriched.reduce((n, { extracted }) => n + extracted.urls.length, 0);
+  const totalDecisions = enriched.reduce((n, { extracted }) => n + (extracted.decisions?.length || 0), 0);
+  const totalIssues    = enriched.reduce((n, { extracted }) => n + (extracted.issues?.length || 0), 0);
+  const totalActions   = enriched.reduce((n, { extracted }) => n + (extracted.actionItems?.length || 0), 0);
+  const totalCommits   = enriched.reduce((n, { extracted }) => n + (extracted.commits?.length || 0), 0);
+  const sessionSummaries = buildSessionSummaries(enriched);
+  const conceptSummaries = buildConceptSummaries(enriched);
+  const effectiveConceptCount = conceptSummaries.length || totalConcepts;
 
-  tui.update({ phase: 'WRITING', pct: 65, concepts: totalConcepts });
-  tui.log(`[SCAN] Extracted ${totalConcepts} concept${totalConcepts !== 1 ? 's' : ''}, ${totalSnippets} snippet${totalSnippets !== 1 ? 's' : ''}`);
+  tui.update({ phase: 'WRITING', pct: 65, concepts: effectiveConceptCount });
+  tui.log(`[SCAN] Extracted ${effectiveConceptCount} concept${effectiveConceptCount !== 1 ? 's' : ''}, ${totalSnippets} snippet${totalSnippets !== 1 ? 's' : ''}`);
 
   print('');
 
@@ -377,10 +426,9 @@ async function runPipeline(opts) {
   print('');
 
   // ── Phase 6: Write defrag.json manifest ─────────────────────────────────
-  const topConceptsList = [...conceptFreq.entries()]
-    .sort((a, b) => b[1] - a[1])
+  const topConceptsList = conceptSummaries
     .slice(0, 10)
-    .map(([c]) => titleCase(c));
+    .map((concept) => concept.name);
 
   const manifest = {
     version:         '1.0',
@@ -388,14 +436,23 @@ async function runPipeline(opts) {
     sources:         scanResults,
     stats: {
       sessions:     dedupedSessions.length,
-      concepts:     totalConcepts,
+      concepts:     effectiveConceptCount,
       snippets:     totalSnippets,
       urls:         totalUrls,
+      decisions:    totalDecisions,
+      issues:       totalIssues,
+      actionItems:  totalActions,
+      commits:      totalCommits,
       links:        linkStats.linksCreated,
       filesWritten: writeStats.written,
+      weakSessions: extractionHealth.weakSessionCount,
     },
+    sessions:        sessionSummaries,
+    concepts:        conceptSummaries,
+    observability:   buildObservabilitySummary(enriched, extractionHealth),
     topConcepts:     topConceptsList,
     vault:           opts.output,
+    output:          opts.output,
     signalThreshold: opts.minSignal,
     ...(opts.model ? { model: opts.model } : {}),
   };
@@ -415,10 +472,9 @@ async function runPipeline(opts) {
   // ── Final summary (100%) ───────────────────────────────────────────────
 
   // Top promoted concepts for the completion screen
-  const topPromoted = [...conceptFreq.entries()]
-    .sort((a, b) => b[1] - a[1])
+  const topPromoted = conceptSummaries
     .slice(0, 5)
-    .map(([c]) => titleCase(c));
+    .map((concept) => concept.name);
 
   tui.update({
     phase: 'COMPLETE', pct: 100,
@@ -440,7 +496,7 @@ async function runPipeline(opts) {
   print('Complete!');
   printStat('Sessions processed', dedupedSessions.length);
   printStat('Session tiers',      `▲${tierCounts.HIGH} ●${tierCounts.MEDIUM} ·${tierCounts.LOW}`);
-  printStat('Concepts extracted', totalConcepts);
+  printStat('Concepts extracted', effectiveConceptCount);
   printStat('Concepts promoted',  writeStats.promoted || 0);
   printStat('Low-signal terms',   writeStats.lowSignalCount || 0);
   printStat('Code snippets',      totalSnippets);
@@ -708,6 +764,134 @@ function deduplicateSessions(sessions) {
   });
 }
 
+function buildSessionSummaries(enriched) {
+  return enriched.map(({ session, extracted }) => ({
+    id: session.id,
+    title: session.title,
+    source: session.source,
+    date: isoDate(session.timestamp),
+    timestamp: session.timestamp.toISOString(),
+    turnCount: session.turnCount,
+    tier: session._sessionTier || 'LOW',
+    signal: Math.round((session._sessionScore || 0) * 10) / 10,
+    conceptCount: extracted.concepts?.length || 0,
+    decisionCount: extracted.decisions?.length || 0,
+    issueCount: extracted.issues?.length || 0,
+    actionItemCount: extracted.actionItems?.length || 0,
+    commitCount: extracted.commits?.length || 0,
+    snippetCount: extracted.snippets?.length || 0,
+    workspace: session.workspace || session.workspaceName || null,
+    workspacePath: session.workspacePath || null,
+    format: session.format || session.cursorFormat || null,
+    topConcepts: (extracted.concepts || []).slice(0, 5),
+    weakSignals: extracted.observability?.weakSignals || [],
+  }));
+}
+
+function buildConceptSummaries(enriched) {
+  const conceptMap = new Map();
+
+  for (const { session, extracted } of enriched) {
+    const conceptObjects = Array.isArray(extracted.conceptObjects) && extracted.conceptObjects.length > 0
+      ? extracted.conceptObjects
+      : (extracted.concepts || []).map((name) => ({ key: name.toLowerCase(), name, kind: 'topic', aliases: [], sourceTypes: [], files: [], tools: [], workspaces: [], relatedConcepts: [] }));
+
+    for (const concept of conceptObjects) {
+      const key = concept.key || concept.name.toLowerCase();
+      let summary = conceptMap.get(key);
+      if (!summary) {
+        summary = {
+          key,
+          name: concept.name,
+          kind: concept.kind || 'topic',
+          aliases: new Set(),
+          sources: new Set(),
+          sessions: new Set(),
+          files: new Set(),
+          tools: new Set(),
+          workspaces: new Set(),
+          related: new Map(),
+          decisionCount: 0,
+          issueCount: 0,
+          actionItemCount: 0,
+          commitCount: 0,
+          mentionCount: 0,
+          scoreHint: 0,
+        };
+        conceptMap.set(key, summary);
+      }
+
+      summary.name = concept.name || summary.name;
+      summary.kind = concept.kind || summary.kind;
+      summary.sources.add(session.source);
+      summary.sessions.add(session.id);
+      summary.mentionCount += concept.mentionCount || 1;
+      summary.scoreHint += concept.score || 0;
+      summary.decisionCount += concept.decisionCount || 0;
+      summary.issueCount += concept.issueCount || 0;
+      summary.actionItemCount += concept.actionItemCount || 0;
+      summary.commitCount += concept.commitCount || 0;
+      for (const alias of (concept.aliases || [])) summary.aliases.add(alias);
+      for (const file of (concept.files || [])) summary.files.add(file);
+      for (const tool of (concept.tools || [])) summary.tools.add(tool);
+      for (const workspace of (concept.workspaces || [])) summary.workspaces.add(workspace);
+      for (const rel of (concept.relatedConcepts || [])) {
+        if (!rel || !rel.key) continue;
+        summary.related.set(rel.key, (summary.related.get(rel.key) || 0) + (rel.count || 1));
+      }
+    }
+  }
+
+  const summaries = [...conceptMap.values()].map((summary) => {
+    const signal = computeSignalScore(summary.name, enriched, enriched);
+    return {
+      key: summary.key,
+      name: summary.name,
+      kind: summary.kind,
+      signal: Math.round(signal * 10) / 10,
+      sessionCount: summary.sessions.size,
+      decisionCount: summary.decisionCount,
+      issueCount: summary.issueCount,
+      actionItemCount: summary.actionItemCount,
+      commitCount: summary.commitCount,
+      mentionCount: summary.mentionCount,
+      aliases: [...summary.aliases].slice(0, 8),
+      sources: [...summary.sources],
+      files: [...summary.files].slice(0, 8),
+      tools: [...summary.tools].slice(0, 8),
+      workspaces: [...summary.workspaces].slice(0, 8),
+      relatedConcepts: [...summary.related.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([key, count]) => ({ key, count })),
+    };
+  });
+
+  return summaries.sort((a, b) =>
+    b.signal - a.signal ||
+    b.sessionCount - a.sessionCount ||
+    a.name.localeCompare(b.name)
+  );
+}
+
+function buildObservabilitySummary(enriched, extractionHealth) {
+  const sessionSummaries = buildSessionSummaries(enriched);
+  const topSignalSessions = [...sessionSummaries]
+    .sort((a, b) => b.signal - a.signal)
+    .slice(0, 12);
+
+  return {
+    extractionHealth: {
+      weakSessionCount: extractionHealth.weakSessionCount,
+      metadataOnlyCursorSessions: extractionHealth.metadataOnlyCursorSessions,
+      truncatedSessions: extractionHealth.truncatedSessions,
+      sourceStats: extractionHealth.sourceStats,
+      weakSessions: extractionHealth.weakSessions,
+    },
+    topSignalSessions,
+  };
+}
+
 // ── Output helpers ────────────────────────────────────────────────────────────
 function printBanner() {
   // In TUI mode the banner is rendered inside the header — keep plain output quiet
@@ -756,7 +940,8 @@ OPTIONS
   --gpt-ko              Print QMD indexing instructions; auto-run if qmd is in PATH
   --min-signal <number> Minimum signal score for a standalone concept note (default: ${DEFAULT_MIN_SIGNAL})
                         Concepts below threshold are listed in _low-signal.md instead.
-                        Score = (sessions×2) + (decisions×5) + (code×3) + (cross-project×4)
+                        Score favors recurring, decision-heavy, issue-rich concepts with
+                        code/context evidence across sessions and workspaces.
   --log-file <path>     Append all activity log entries to a plain-text file
   --no-tui              Disable the full-screen TUI; use plain console output instead.
                         Useful for CI, piping to a file, or debugging.
@@ -782,6 +967,9 @@ SIGNAL SCORING
   Each concept earns signal points based on how it appears across sessions:
     sessions   ×2  — number of sessions the concept appeared in
     decisions  ×5  — decision sentences that explicitly mention it
+    issues     ×4  — bugs/problems explicitly tied to the concept
+    actions    ×4  — follow-ups and next steps anchored to the concept
+    commits    ×3  — commit/PR/change signals mentioning the concept
     code       ×3  — code snippets whose body references it
     projects   ×4  — distinct workspace/source paths where it appeared
 

@@ -693,9 +693,10 @@ async function loadDefragJson() {
 function buildRealMsgPools() {
   if (!realData) return;
 
-  const stats    = realData.stats    || {};
-  const concepts = realData.concepts || [];
-  const sessions = realData.sessions || [];
+  const stats        = realData.stats    || {};
+  const concepts     = realData.concepts || [];
+  const sessions     = realData.sessions || [];
+  const weakSessions = realData.observability?.extractionHealth?.weakSessions || [];
 
   // Augment scan messages with real session titles
   if (sessions.length > 0) {
@@ -711,6 +712,13 @@ function buildRealMsgPools() {
       'Extracting concept: [[' + (typeof c === 'string' ? c : c.name || c.title || String(c)) + ']]'
     );
     MSGS.scan = MSGS.scan.concat(realConceptMsgs);
+  }
+
+  if (weakSessions.length > 0) {
+    const weakMsgs = weakSessions.slice(0, 8).map(s =>
+      'Weak extraction: ' + (s.title || s.id || 'session') + ' [' + (s.weakSignals || []).join(', ') + ']'
+    );
+    MSGS.scan = weakMsgs.concat(MSGS.scan);
   }
 
   // Augment defrag messages with real concept writing lines
@@ -1182,14 +1190,17 @@ function nextMsg(pool, key) {
    ════════════════════════════════════════════════════════════ */
 function showVaultReady() {
   if (!realData) return;
-  const stats    = realData.stats    || {};
-  const concepts = realData.concepts || [];
-  const sessions = realData.sessions || [];
-  const output   = realData.output   || realData.vault || '~/vault';
+  const stats        = realData.stats    || {};
+  const concepts     = realData.concepts || [];
+  const sessions     = realData.sessions || [];
+  const extraction   = realData.observability?.extractionHealth || {};
+  const output       = realData.output   || realData.vault || '~/vault';
 
   const sessionCount  = stats.sessions    || stats.conversations || sessions.length || 0;
   const conceptCount  = stats.concepts    || concepts.length || 0;
   const linkCount     = stats.links       || stats.wikilinks || 0;
+  const weakCount     = extraction.weakSessionCount || 0;
+  const cursorMeta    = extraction.metadataOnlyCursorSessions || 0;
 
   // Top concepts (up to 5)
   const topConcepts = concepts.slice(0, 5).map(c =>
@@ -1215,6 +1226,8 @@ function showVaultReady() {
     row(pad('Sessions processed:   ', sessionCount, W - 4)),
     row(pad('Concepts extracted:   ', conceptCount, W - 4)),
     row(pad('Links created:        ', linkCount,    W - 4)),
+    row(pad('Weak sessions:        ', weakCount,    W - 4)),
+    row(pad('Cursor meta-only:     ', cursorMeta,   W - 4)),
     row(pad('Output: ', output, W - 4)),
     blank,
   ];

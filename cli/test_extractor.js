@@ -133,10 +133,15 @@ test('extract returns all expected fields', () => {
   ]);
   const result = extract(session);
   assert(Array.isArray(result.concepts), 'concepts should be an array');
+  assert(Array.isArray(result.conceptObjects), 'conceptObjects should be an array');
   assert(Array.isArray(result.decisions), 'decisions should be an array');
+  assert(Array.isArray(result.issues), 'issues should be an array');
+  assert(Array.isArray(result.actionItems), 'actionItems should be an array');
+  assert(Array.isArray(result.commits), 'commits should be an array');
   assert(Array.isArray(result.snippets), 'snippets should be an array');
   assert(Array.isArray(result.urls), 'urls should be an array');
   assert(Array.isArray(result.entities), 'entities should be an array');
+  assert(result.observability && typeof result.observability === 'object', 'observability should exist');
 });
 
 test('extract finds backtick-wrapped concepts', () => {
@@ -156,6 +161,49 @@ test('extract finds decision patterns', () => {
   ]);
   const result = extract(session);
   assert(result.decisions.length > 0, 'should find at least one decision');
+  assertIncludes(result.concepts, 'PostgreSQL', 'single high-signal decision concept should survive');
+});
+
+test('extract finds issues, actions, and commit signals', () => {
+  const session = makeSession([
+    'The issue is that `cursor.js` is broken and Cursor sessions are missing from the vault.',
+    'Next step: update `cursor.js`, commit the fix, and open a pull request.',
+  ], {
+    source: 'cursor',
+    workspacePath: '/Users/me/context-defrag',
+    filesTouched: ['cli/miners/cursor.js'],
+  });
+  const result = extract(session);
+  assert(result.issues.length > 0, 'should detect issue framing');
+  assert(result.actionItems.length > 0, 'should detect action items');
+  assert(result.commits.length > 0, 'should detect commit or PR signals');
+  assertIncludes(result.files, 'cli/miners/cursor.js', 'should retain technical file context');
+});
+
+test('extract creates rich concept objects', () => {
+  const session = makeSession([
+    'We decided to use `PostgreSQL` for metadata storage.',
+    'Follow-up: add migrations and commit the PostgreSQL schema changes.',
+  ]);
+  const result = extract(session);
+  const postgres = result.conceptObjects.find((concept) => concept.name === 'PostgreSQL');
+  assert(postgres, 'should expose PostgreSQL as a rich concept object');
+  assert(postgres.kind, 'concept should have a kind');
+  assert(Array.isArray(postgres.evidence) && postgres.evidence.length > 0, 'concept should retain evidence');
+  assert(postgres.decisionCount > 0 || postgres.actionItemCount > 0, 'concept should retain structured counts');
+});
+
+test('extract marks metadata-only cursor sessions as weak', () => {
+  const session = makeSession([
+    'Discuss fixing weak Cursor extraction',
+  ], {
+    source: 'cursor',
+    cursorMetaOnly: true,
+    workspacePath: '/Users/me/context-defrag',
+  });
+  const result = extract(session);
+  assert(result.observability.weakSignals.includes('metadata-only cursor session'),
+    'should surface metadata-only cursor sessions');
 });
 
 test('extract finds code snippets', () => {
