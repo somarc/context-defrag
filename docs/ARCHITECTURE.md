@@ -204,7 +204,9 @@ Signal scoring answers the question: **of all the concepts that appear across yo
 ### The formula
 
 ```
-signalScore = (sessionCount × 2) + (decisionCount × 5) + (codeCount × 3) + (crossProjectCount × 4)
+signalScore = (sessionCount × 2) + (decisionCount × 5) + (codeCount × 3)
+            + (crossProjectCount × 4) + (decisionPatternDiversity × 2)
+            + recencyBoost + skillBonus
 ```
 
 Implemented in `extractor.js → computeSignalScore()`:
@@ -275,6 +277,24 @@ Weight 3 is higher than session frequency (2) because code evidence is more conc
 The 4× weight reflects that cross-project recurrence is the strongest environmental indicator of structural importance. "AEM Replication" showing up in three different workspace paths means you've thought about it in three different problem contexts — three different projects, three different codebases, potentially three different teams. That concept has earned its own note. "AEM Replication" showing up 50 times in one project might just be background noise from a focused sprint.
 
 Note that `projectSources` is a `Set` — adding the same source or path twice doesn't increase the count. The weight is applied to the count of *distinct* workspaces, not total appearances.
+
+**`decisionPatternDiversity × 2` — Reasoning breadth**
+
+Decision sentences are classified into four pattern types: CHOICE ("decided to", "going with"), AVOIDANCE ("avoid", "do not use"), EVOLUTION ("switched", "migrated"), and CONFIRMATION ("confirmed", "still using"). A concept with decisions spanning multiple pattern types indicates real multi-angle reasoning — someone wrestled with it from different directions. The diversity count (number of distinct pattern types present) gets a 2x weight. Additive rather than multiplicative, for debuggability — you can always inspect exactly why a concept scored what it did from the `signal-breakdown` frontmatter field.
+
+Implemented in `classifyDecisionPattern()` and `computeDecisionPatternDiversity()` in `extractor.js`.
+
+**`recencyBoost` — Active knowledge (conditional +1.5)**
+
+Relative to the user's own session timeline, not an absolute time window. If the concept appears in any session from the top 25% (p75) of the user's chronological session distribution, add +1.5. Guard: only applied when `allSessions.length >= 20` — small histories make p75 noisy. Pure recency cannot promote weak concepts; the bonus only matters when combined with meaningful base signal.
+
+Implemented in `computeRecencyBonus()` in `extractor.js`.
+
+**`skillBonus` — Codex skill provenance (+6 per session)**
+
+When a concept is explicitly named as a Codex skill that was invoked in a session, +6 per such session. Skill names are machine-structured (parsed from AGENTS.md injection in Codex Desktop sessions), not inferred from free text — this is the highest-fidelity signal available. A single skill invocation in one session scores 8 (`2 + 6`), which crosses the default threshold on its own. This is intentional: if Codex invoked a skill by name, it's definitionally a real tool in the user's workflow.
+
+Implemented via `seedTerms` in `extractConcepts()` and the `skillBonus` accumulator in `computeSignalScore()`.
 
 ### The default threshold: 8
 
@@ -554,7 +574,50 @@ The Obsidian graph is meaningful only if its nodes represent things worth knowin
 
 ---
 
-## 7. The Linker
+## 7. Session Signal Scoring
+
+While concept scoring determines which concepts deserve standalone notes, session scoring determines **how much content each session note receives**. Not all sessions are equal: a 47-turn session with 8 decisions is worth full narrative treatment; a 2-message "hello world" exchange is not.
+
+### The formula
+
+```
+sessionScore = (turnCount × 0.5) + (decisionCount × 3) + (snippetCount × 2) + (conceptCount × 0.3)
+```
+
+Implemented in `extractor.js` as `computeSessionScore(session, extracted)`.
+
+### The tiers
+
+| Tier | Score | Content depth | Rationale |
+|------|-------|--------------|-----------|
+| HIGH | >= 12 | Full treatment: narrative summary + decisions + concepts + code snippets + URLs + Codex context | Rich sessions that represent real work worth preserving in full |
+| MEDIUM | 5-11 | Focused: narrative + decisions + top concepts. Skips code/URL/entity sections | Moderate sessions — the conversation had substance but not enough to warrant full expansion |
+| LOW | < 5 | Minimal ~10 lines: title, date, source, top 3 concept links | Thin sessions that exist for graph completeness but don't warrant compute or reading time |
+
+### Performance optimization
+
+`extractSessionNarrative()` is skipped entirely for LOW-tier sessions. The narrative heuristic (Section 5) is the most expensive per-session operation — it scans all messages for opening/approach/outcome patterns. For a 2-message session with no decisions, this work produces nothing useful. Computing `sessionScore` first (which is essentially free — just counting fields) and short-circuiting saves measurable time across hundreds of sessions.
+
+### Frontmatter
+
+All session notes include:
+- `session-signal: <score>` — the raw computed score
+- `tier: high|medium|low` — rendering tier applied
+
+LOW-tier sessions additionally receive the `low-signal` tag so they can be filtered in Obsidian searches.
+
+### Why still create files for LOW sessions
+
+Every session gets an individual file regardless of tier. This preserves:
+1. **Obsidian graph connectivity** — backlinks from concept notes to sessions work regardless of depth
+2. **QMD indexing** — semantic search can find content in any session
+3. **Complete timeline** — `_timeline.md` lists every session chronologically with tier indicators
+
+The minimal LOW format (~10 lines) adds negligible disk and graph noise while maintaining structural completeness.
+
+---
+
+## 8. The Linker
 
 The linker (`cli/writers/linker.js`) runs as a post-processing pass over the written vault. Its job is to inject `[[wikilinks]]` into plain-text mentions of known note titles, so that concepts referenced in session notes automatically become navigable links in Obsidian.
 
@@ -648,7 +711,7 @@ A note is never linked to itself. The `linkifyTerm()` function replaces all occu
 
 ---
 
-## 8. Source Formats
+## 9. Source Formats
 
 Each miner is responsible for a single source's format. All miners implement the same interface:
 
@@ -890,7 +953,7 @@ The `cwd` field, when present, is normalized to a project slug via `path.basenam
 
 ---
 
-## 9. Idempotency
+## 10. Idempotency
 
 Context Defrag is designed to be run repeatedly on a live vault — after every work session, on a cron schedule, or in `--watch` mode. Re-runs must update content without duplicating or destroying it.
 
@@ -953,7 +1016,7 @@ Session IDs are FNV-1a hashes of file paths. As long as source files don't move,
 
 ---
 
-## 10. The `defrag.json` Manifest
+## 11. The `defrag.json` Manifest
 
 After each complete run, `defrag.json` is written to the vault root. It serves three distinct roles.
 
@@ -1032,7 +1095,7 @@ The `generated` timestamp and per-source session counts are the foundation for a
 
 ---
 
-## 11. Vault Structure Decisions
+## 12. Vault Structure Decisions
 
 ### Why `{source}-{date}-{title}` for session filenames?
 
@@ -1113,7 +1176,7 @@ The `source` field enables QMD's `--source` filter. The `tags` field powers Obsi
 
 ---
 
-## 12. QMD Integration
+## 13. QMD Integration
 
 QMD is the semantic search companion to `context-defrag`. After running `context-defrag`, users run:
 
@@ -1153,7 +1216,7 @@ The vault is designed to be a good QMD input:
 
 ---
 
-## 13. Extension Points
+## 14. Extension Points
 
 ### Adding a new miner
 
