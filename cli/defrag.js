@@ -173,13 +173,15 @@ async function runPipeline(opts) {
       continue;
     }
 
-    const { sessions, skipped } = result;
+    const { sessions, skipped, metaOnlyDropped } = result;
 
     if (skipped && sessions.length === 0) {
       printStatus('--', SOURCE_DISPLAY_PATHS[source], 'Not found, skipping');
       scanResults[source] = { status: 'missing', found: false, sessions: 0, path: SOURCE_DISPLAY_PATHS[source] };
     } else {
-      printStatus('OK', SOURCE_DISPLAY_PATHS[source], `${sessions.length} conversation${sessions.length !== 1 ? 's' : ''} found`);
+      const dropNote = metaOnlyDropped ? ` (${metaOnlyDropped} metadata-only dropped)` : '';
+      printStatus('OK', SOURCE_DISPLAY_PATHS[source], `${sessions.length} conversation${sessions.length !== 1 ? 's' : ''} found${dropNote}`);
+      if (metaOnlyDropped) tui.log(`[FILTER] Cursor: dropped ${metaOnlyDropped} metadata-only composer entries (no transcript)`);
       scanResults[source] = { status: 'found', found: true, sessions: sessions.length, path: SOURCE_DISPLAY_PATHS[source] };
     }
 
